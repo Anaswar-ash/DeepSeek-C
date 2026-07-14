@@ -101,9 +101,16 @@ def dequant(f, name):
     sl = f.get_slice(name); dt = sl.get_dtype()
     if dt in ("F8_E4M3", "float8_e4m3fn"):
         w = f.get_tensor(name).to(torch.float32)
-        sc = f.get_tensor(name + "_scale_inv").to(torch.float32)   # [ceil(O/128),ceil(I/128)]
+        try:
+            sc = f.get_tensor(name + "_scale_inv").to(torch.float32)
+        except Exception:
+            sc = f.get_tensor(name.replace(".weight", ".scale")).to(torch.float32)
+            
         O, I = w.shape
-        sc = sc.repeat_interleave(128, 0).repeat_interleave(128, 1)[:O, :I]
+        if sc.ndim == 2:
+            sc = sc.repeat_interleave(128, 0).repeat_interleave(128, 1)[:O, :I]
+        elif sc.ndim == 1:
+            sc = sc.unsqueeze(1).expand(O, I)
         return (w * sc).numpy()
     return f.get_tensor(name).to(torch.float32).numpy()
 
@@ -258,7 +265,7 @@ def main():
             except Exception: pass
         if not os.path.exists(part):
             with open(part, "wb") as f: f.truncate(expected)   # file sparse / sparse file
-        fd = os.open(part, os.O_WRONLY)
+        fd = os.open(part, os.O_WRONLY | getattr(os, 'O_BINARY', 0))
         t0 = _t.time(); nres = [0]; log_lock = threading.Lock(); stopfail = []
         def worker(t):
             s0, s1 = segs[t]
