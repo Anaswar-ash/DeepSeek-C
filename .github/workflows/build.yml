@@ -7,19 +7,31 @@ on:
     branches: [ "main" ]
 
 jobs:
-  build:
+  build-linux:
     runs-on: ubuntu-latest
-    
     steps:
-    - uses: actions/checkout@v3
+    - uses: actions/checkout@v4
 
     - name: Install dependencies
-      run: sudo apt-get update && sudo apt-get install -y build-essential gcc
+      run: sudo apt-get update && sudo apt-get install -y build-essential gcc cppcheck
 
     - name: Compile Engine
       run: make dsv4
 
     - name: Static Analysis
+      run: cppcheck --error-exitcode=1 dsv4.c
+
+  build-windows:
+    runs-on: windows-latest
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Compile Windows Executable
       run: |
-        sudo apt-get install -y cppcheck
-        cppcheck --error-exitcode=1 dsv4.c
+        gcc -D_FILE_OFFSET_BITS=64 -O3 -march=x86-64-v3 -fopenmp -Wall -Wextra -Wno-unused-parameter -Wno-misleading-indentation -Wno-unused-function dsv4.c -o dsv4.exe -lm -static
+
+    - name: Upload Executable
+      uses: actions/upload-artifact@v4
+      with:
+        name: DeepSeek-V4-Windows-Exe
+        path: dsv4.exe
