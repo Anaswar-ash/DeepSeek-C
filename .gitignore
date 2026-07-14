@@ -1,0 +1,11 @@
+﻿*.exe
+*.o
+*.dll
+*.exp
+*.lib
+__pycache__/
+v4_int4/
+.vscode/
+.convert.lock
+*.part
+*.safetensors
