@@ -120,10 +120,23 @@ static void tok_load(Tok *T, const char *path){
     hm_init(&T->merges, mc);
     for(int i=0;i<merges->len;i++){
         jval *pr=merges->kids[i];
-        const char *l=pr->kids[0]->str, *r=pr->kids[1]->str;
-        int ll=(int)strlen(l), rl=(int)strlen(r);
-        char *key=malloc(ll+1+rl); memcpy(key,l,ll); key[ll]=0; memcpy(key+ll+1,r,rl);
-        hm_put(&T->merges, key, ll+1+rl, i);
+        if (pr->t == J_STR) {
+            const char *space = strchr(pr->str, ' ');
+            if (space) {
+                int ll = space - pr->str;
+                int rl = strlen(space + 1);
+                char *key = malloc(ll+1+rl);
+                memcpy(key, pr->str, ll);
+                key[ll] = 0;
+                memcpy(key+ll+1, space+1, rl);
+                hm_put(&T->merges, key, ll+1+rl, i);
+            }
+        } else if (pr->kids && pr->len >= 2) {
+            const char *l=pr->kids[0]->str, *r=pr->kids[1]->str;
+            int ll=(int)strlen(l), rl=(int)strlen(r);
+            char *key=malloc(ll+1+rl); memcpy(key,l,ll); key[ll]=0; memcpy(key+ll+1,r,rl);
+            hm_put(&T->merges, key, ll+1+rl, i);
+        }
     }
     /* added tokens (speciali e non): atomici, output letterale */
     if(added){

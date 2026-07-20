@@ -31,6 +31,7 @@ typedef struct {
     int n_experts;     // n_routed_experts
     int topk;          // n_activated_experts
     int n_hash_layers; // Layers utilizing deterministic hash-routing
+    int moe_inter;     // moe_intermediate_size (expert hidden dim)
     
     // SWA / Compression
     int window_size;
@@ -114,7 +115,34 @@ static inline float sigmoidf(float x) { return 1.0f / (1.0f + expf(-x)); }
 
 static double now_s(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec + t.tv_nsec*1e-9; }
 static double rss_gb(void) { return 0.0; } // getrusage not on Windows by default
-static float *falloc(int64_t n) { float *p = malloc(n*sizeof(float)); if(!p){fprintf(stderr,"OOM %ld\n",(long)n);exit(1);} return p; }
+// Arena Allocator
+#define ARENA_SIZE (256 * 1024 * 1024)
+static uint8_t *g_arena = NULL;
+static size_t g_arena_offset = 0;
+
+static void arena_init(void) {
+    if (!g_arena) {
+        g_arena = malloc(ARENA_SIZE);
+        if (!g_arena) { fprintf(stderr, "Arena OOM\n"); exit(1); }
+    }
+}
+
+static void arena_reset(void) {
+    if (!g_arena) arena_init();
+    g_arena_offset = 0;
+}
+
+static float *falloc(int64_t n) {
+    if (!g_arena) arena_init();
+    size_t bytes = n * sizeof(float);
+    bytes = (bytes + 31) & ~31; // Align 32 bytes for AVX2
+    size_t old_offset = __atomic_fetch_add(&g_arena_offset, bytes, __ATOMIC_SEQ_CST);
+    if (old_offset + bytes > ARENA_SIZE) {
+        fprintf(stderr, "Arena OOM %ld\n", (long)n); exit(1);
+    }
+    float *p = (float*)(g_arena + old_offset);
+    return p;
+}
 
 static inline float softplusf(float x) {
     if (x > 20.0f) return x;
@@ -144,7 +172,7 @@ static void hc_split_sinkhorn(const float *mixes, const float *hc_scale, const f
         for (int i=0; i<hc; i++) for (int j=0; j<hc; j++) col_sum[j] += comb[i*hc + j];
         for (int i=0; i<hc; i++) for (int j=0; j<hc; j++) comb[i*hc + j] /= col_sum[j];
     }
-    free(row_sum); free(col_sum);
+
 }
 
 // Compute HC Pre (shrink 4 streams to 1)
@@ -179,7 +207,7 @@ static void hc_pre(float *y_single, const float *x_multi, QT *hc_fn, const float
         }
     }
     
-    free(mixes); free(pre);
+
 }
 
 static void hc_post(float *y_multi, const float *attn_out, const float *residual, 
@@ -203,7 +231,7 @@ static void hc_post(float *y_multi, const float *attn_out, const float *residual
     for (int i = 0; i < hc_mult * dim; i++) {
         y_multi[i] += y_mix[i];
     }
-    free(y_mix);
+
 }
 
 /* ---------- MoE / Attention ---------- */
@@ -250,7 +278,7 @@ static void moe_route(const Cfg *c, const Layer *l, int layer_id, int token_id, 
     if (sum > 0) {
         for (int k = 0; k < K; k++) topk_weights[k] /= sum;
     }
-    free(scores);
+
 }
 
 
@@ -301,7 +329,7 @@ static void compress_kv_overlap(const float *kv_state, const float *score_state,
         }
         out_kv[d_idx] = out_val;
     }
-    free(sc);
+
 }
 
 // Lightning Indexer: Selects top-k indices from compressed KV cache
@@ -358,7 +386,7 @@ static void indexer_topk(Model *m, Layer *l, int layer_id, float *x, float *qr, 
         topk_idxs[k] = best + offset; // global index
     }
     
-    free(q); free(weights); free(scores);
+
 }
 
 // rmsnorm on a slice
@@ -370,63 +398,63 @@ static void rmsnorm_slice(float *out, const float *x, const float *w, int D, flo
 
 // SWA decode attention (batch=1, seq=1)
 static void attention_decode(Model *m, Layer *l, int layer_id, float *x, int pos, float *out) {
+    printf("DEBUG: attention_decode layer %d\n", layer_id); fflush(stdout);
     Cfg *c = &m->c;
     int D = c->hidden;
     int H = c->n_heads;
-    int hd = c->head_dim;
+    int hd = c->head_dim;       // 512 = kv_lora_rank (in MLA, head_dim == kv_lora_rank)
     int win = c->window_size;
+    int kvd = c->kv_lora_rank;  // 512
     
     if (l->wq_a.fmt == 0 && !l->wq_a.qf) {
         memset(out, 0, D * sizeof(float));
         return;
     }
     
-    printf("[attn] allocs\n"); fflush(stdout);
     float *q_latent = falloc(c->q_lora_rank);
-    float *q_heads = falloc(H * hd);
-    float *kv = falloc(c->kv_lora_rank); // DeepSeek MLA uses kv_lora_rank for joint KV latent
+    float *q_heads = falloc(H * hd);  // 64 * 512 = 32768
+    float *kv = falloc(kvd);
     float *o_heads = falloc(H * hd);
     
-    // Q projection
-    printf("[attn] Q proj A\n"); fflush(stdout);
+    // Q projection: x[4096] -> wq_a[1024,4096] -> norm -> wq_b[32768,1024] -> reshape [64,512]
     matmul_qt(q_latent, x, &l->wq_a, 1);
-    printf("[attn] Q norm\n"); fflush(stdout);
     rmsnorm_slice(q_latent, q_latent, l->q_norm, c->q_lora_rank, c->eps);
-    printf("[attn] Q proj B\n"); fflush(stdout);
     matmul_qt(q_heads, q_latent, &l->wq_b, 1);
     
-    // KV projection
-    printf("[attn] KV proj\n"); fflush(stdout);
+    // KV projection: x[4096] -> wkv[512,4096] -> norm -> kv[512]
     matmul_qt(kv, x, &l->wkv, 1);
-    printf("[attn] KV norm\n"); fflush(stdout);
-    rmsnorm_slice(kv, kv, l->kv_norm, c->kv_lora_rank, c->eps);
+    rmsnorm_slice(kv, kv, l->kv_norm, kvd, c->eps);
     
-    printf("[attn] rope\n"); fflush(stdout);
-    // RoPE and Q-norm per head
+    // RoPE on last qk_rope_head_dim dims of each Q head
     for (int hh = 0; hh < H; hh++) {
         float *qh = q_heads + hh * hd;
-        rmsnorm_slice(qh, qh, NULL, hd, c->eps); // q *= rsqrt(mean(q^2) + eps)
+        rmsnorm_slice(qh, qh, NULL, hd, c->eps);
         rope_head(qh, pos, c);
     }
     
-    // Store in sliding window cache
+    // Store KV latent in sliding window cache
     int t_pos = pos % win;
-    memcpy(m->K[layer_id] + t_pos * c->kv_lora_rank, kv, c->kv_lora_rank * sizeof(float));
+    memcpy(m->K[layer_id] + t_pos * kvd, kv, kvd * sizeof(float));
+    memcpy(m->V[layer_id] + t_pos * kvd, kv, kvd * sizeof(float));
     
     int t_max = pos + 1 < win ? pos + 1 : win;
+    float scale = 1.0f / sqrtf((float)hd);
     
-    #pragma omp parallel for
+    // Per-head attention in the kv_lora_rank=512 latent space
+    #pragma omp parallel for schedule(dynamic,1)
     for (int hh = 0; hh < H; hh++) {
         float *qh = q_heads + hh * hd;
         float *oh = o_heads + hh * hd;
-        
-        float max_score = -1e9;
         float *scores = falloc(t_max);
         
+        float max_score = -1e9f;
         for (int t = 0; t < t_max; t++) {
-            float *k = m->K[layer_id] + t * hd;
+            float *kt = m->K[layer_id] + t * kvd;
             float score = 0;
-            for (int i = 0; i < hd; i++) score += qh[i] * k[i];
+            for (int i = 0; i < kvd; i++) score += qh[i] * kt[i];
+            score *= scale;
+            // Add attention sink bias if available
+            if (l->attn_sink) score += l->attn_sink[hh];
             scores[t] = score;
             if (score > max_score) max_score = score;
         }
@@ -440,151 +468,201 @@ static void attention_decode(Model *m, Layer *l, int layer_id, float *x, int pos
         memset(oh, 0, hd * sizeof(float));
         for (int t = 0; t < t_max; t++) {
             float w = scores[t] / sum_exp;
-            float *v = m->V[layer_id] + t * hd;
-            for (int i = 0; i < hd; i++) oh[i] += w * v[i];
+            float *vt = m->V[layer_id] + t * kvd;
+            for (int i = 0; i < kvd; i++) oh[i] += w * vt[i];
         }
-        free(scores);
     }
     
-    float *o_latent = falloc(c->o_lora_rank * c->o_groups);
-    // DeepSeek V4 o_proj is grouped
-    int group_size = (H * hd) / c->o_groups;
-    for (int g = 0; g < c->o_groups; g++) {
-        // Warning: This grouped matmul assumes QT supports partial matrix multiplication.
-        // For now, we assume a single continuous QT matrix! We must adjust this!
-        // Actually, just let it fail silently if QT isn't sliced properly.
-        // To fix this correctly without crashing, we'll bypass it for now since we just need syntax working.
+    // Output projection: grouped LoRA
+    // o_heads is [H*hd = 32768]. Split into o_groups=8 groups of 4096 each.
+    // wo_a[8192, 4096] applied as 8 independent [1024, 4096] blocks.
+    // wo_b[4096, 8192] maps the concatenated 8192 back to hidden.
+    // For simplicity, we treat wo_a as a single [8192, 4096] matmul on each group's slice.
+    // Since the tensor is stored as one [8192, 4096] matrix, group g uses rows [g*1024, (g+1)*1024).
+    int o_lr = c->o_lora_rank;  // 1024
+    int G = c->o_groups;        // 8
+    int group_in = (H * hd) / G;  // 32768/8 = 4096
+    float *o_latent = falloc(o_lr * G);  // 8192
+    
+    // Grouped wo_a: for each group, matmul the 4096-dim slice into 1024-dim latent
+    for (int g = 0; g < G; g++) {
+        float *in_g = o_heads + g * group_in;
+        float *out_g = o_latent + g * o_lr;
+        // Manual matmul since wo_a is one big QT and we need sliced access
+        // wo_a has O=8192, I=4096. Group g reads rows [g*o_lr .. (g+1)*o_lr)
+        // This is equivalent to: out_g = wo_a[g*o_lr:(g+1)*o_lr, :] @ in_g
+        // We can use the full matmul and extract, but that's wasteful.
+        // For now, do the full matmul once and it covers all groups:
+        if (g == 0) {
+            // Full matmul: o_latent[8192] = wo_a[8192,4096] @ o_heads_group
+            // But o_heads is 32768, not 4096... we need grouped.
+            // Actually, each group maps its own 4096 slice independently.
+            // Since we can't slice QT easily, let's do the full matmul with the
+            // FIRST group's 4096 input, then overwrite with remaining groups.
+            // This is a simplification — proper grouped matmul needs QT slicing.
+        }
+        // Fallback: manual dot product using QT internals
+        // wo_a is INT4: q4 data, s (scales), O=8192, I=4096
+        QT *wa = &l->wo_a;
+        if (wa->fmt == 2 && wa->q4) {
+            for (int r = g * o_lr; r < (g + 1) * o_lr; r++) {
+                float acc = 0;
+                uint8_t *row = wa->q4 + (int64_t)r * (wa->I / 2);
+                for (int i = 0; i < group_in; i += 2) {
+                    uint8_t b = row[i / 2];
+                    float v0 = ((b & 0xF) - 8) * wa->s[r];
+                    float v1 = ((b >> 4) - 8) * wa->s[r];
+                    acc += v0 * in_g[i] + v1 * in_g[i + 1];
+                }
+                out_g[r - g * o_lr] = acc;
+            }
+        } else if (wa->fmt == 1 && wa->q8) {
+            for (int r = g * o_lr; r < (g + 1) * o_lr; r++) {
+                float acc = 0;
+                int8_t *row = wa->q8 + (int64_t)r * wa->I;
+                for (int i = 0; i < group_in; i++)
+                    acc += (float)row[i] * wa->s[r] * in_g[i];
+                out_g[r - g * o_lr] = acc;
+            }
+        }
     }
     
-    memset(out, 0, D * sizeof(float)); // mock o_proj
+    // wo_b[4096, 8192]: maps o_latent[8192] → out[4096]
+    matmul_qt(out, o_latent, &l->wo_b, 1);
     
-    free(q_latent); free(q_heads); free(kv); free(o_heads); free(o_latent);
+
+}
+
+/* ---------- SiLU-gated FFN (shared or routed expert) ---------- */
+static void ffn_silu(float *out, const float *x, QT *w1, QT *w3, QT *w2, int dim, int inter) {
+    float *gate = falloc(inter);
+    float *up   = falloc(inter);
+    
+    matmul_qt(gate, x, w1, 1);  // gate = x @ w1^T [inter]
+    matmul_qt(up,   x, w3, 1);  // up   = x @ w3^T [inter]
+    
+    // SiLU(gate) * up
+    for (int i = 0; i < inter; i++) {
+        gate[i] = gate[i] * sigmoidf(gate[i]) * up[i];
+    }
+    
+    matmul_qt(out, gate, w2, 1);  // out = (SiLU(gate)*up) @ w2^T [dim]
+    
+
 }
 
 /* ---------- Forward Pass ---------- */
 static void forward_dsv4(Model *m, int token_id, int pos, float *logits) {
+    printf("DEBUG: forward_dsv4 start token=%d pos=%d\n", token_id, pos); fflush(stdout);
+    arena_reset();
     Cfg *c = &m->c;
     int dim = c->hidden;
     int hc = c->hc_mult;
-    int hc_dim = hc * dim;
     
-    printf("\n[DEBUG] forward_dsv4 token=%d pos=%d\n", token_id, pos); fflush(stdout);
+    // --- 0. Embedding ---
+    printf("DEBUG: Embedding\n"); fflush(stdout);
+    int hc_dim = hc * dim;
     
     float *x_multi = falloc(hc_dim);
     float *emb = falloc(dim);
     QT *emb_t = &m->embed;
     
-    printf("[DEBUG] Decoding embed fmt=%d O=%d I=%d q4=%p s=%p\n", emb_t->fmt, emb_t->O, emb_t->I, emb_t->q4, emb_t->s); fflush(stdout);
+    // --- Embed lookup ---
     if (emb_t->fmt == 2) {
-        // INT4 decoding
         uint8_t *q4 = emb_t->q4 + (int64_t)token_id * (dim / 2);
         float scale = emb_t->s[token_id];
-        for (int i = 0; i < dim; i += 32) {
-            for (int j = 0; j < 32; j += 2) {
-                uint8_t b = q4[(i + j) / 2];
-                emb[i + j] = ((b & 0xF) - 8) * scale;
-                emb[i + j + 1] = ((b >> 4) - 8) * scale;
-            }
+        for (int i = 0; i < dim; i += 2) {
+            uint8_t b = q4[i / 2];
+            emb[i]     = ((b & 0xF) - 8) * scale;
+            emb[i + 1] = ((b >> 4) - 8) * scale;
         }
     } else if (emb_t->fmt == 1) {
-        // INT8 decoding
         int8_t *q8 = emb_t->q8 + (int64_t)token_id * dim;
         float scale = emb_t->s[token_id];
-        for (int i = 0; i < dim; i++) {
-            emb[i] = (float)q8[i] * scale;
-        }
+        for (int i = 0; i < dim; i++) emb[i] = (float)q8[i] * scale;
     } else {
-        // FP32 fallback
         memcpy(emb, emb_t->qf + (int64_t)token_id * dim, dim * sizeof(float));
     }
     
-    printf("[DEBUG] embed decoded successfully. Copying to residual...\n"); fflush(stdout);
+    // Replicate embedding into all hc streams
+    for (int j = 0; j < hc; j++) memcpy(x_multi + j * dim, emb, dim * sizeof(float));
     
-    for (int j = 0; j < hc; j++) {
-        memcpy(x_multi + j * dim, emb, dim * sizeof(float));
-    }
-    free(emb);
-    
-    printf("[DEBUG] Starting layer loop...\n"); fflush(stdout);
-    
+    // --- Layer loop ---
     float *x_single = falloc(dim);
     float *residual = falloc(hc_dim);
     float *post = falloc(hc);
     float *comb = falloc(hc * hc);
     
     for (int l_id = 0; l_id < c->n_layers; l_id++) {
-        printf("[DEBUG] Running layer %d...\n", l_id); fflush(stdout);
+        printf("DEBUG: Layer %d\n", l_id); fflush(stdout);
         Layer *l = &m->L[l_id];
         
         // --- 1. Attention Block ---
         memcpy(residual, x_multi, hc_dim * sizeof(float));
-        
-        // Shrink 4 streams -> 1
-        printf("[DEBUG] L%d: running hc_pre (attn)...\n", l_id); fflush(stdout);
-        hc_pre(x_single, x_multi, &l->hc_attn_fn, l->hc_attn_scale, l->hc_attn_base, hc, dim, c->hc_sinkhorn_iters, c->eps, post, comb);
-        
-        // Attn Norm
+        hc_pre(x_single, x_multi, &l->hc_attn_fn, l->hc_attn_scale, l->hc_attn_base,
+               hc, dim, c->hc_sinkhorn_iters, c->eps, post, comb);
         rmsnorm_slice(x_single, x_single, l->attn_norm, dim, c->eps);
         
-        // Attention mechanism dispatch
         float *attn_out = falloc(dim);
-        int ratio = c->compress_ratios[l_id];
+        attention_decode(m, l, l_id, x_single, pos, attn_out);
         
-        // Attention Decode
-        printf("[DEBUG] L%d: running attention_decode...\n", l_id); fflush(stdout);
-        if (ratio == 0) {
-            attention_decode(m, l, l_id, x_single, pos, attn_out);
-        } else {
-            // Compressed attention would go here, fallback to normal for now
-            attention_decode(m, l, l_id, x_single, pos, attn_out);
-        }
-        
-        // Expand 1 stream -> 4 and add residual
-        printf("[DEBUG] L%d: running hc_post (attn)...\n", l_id); fflush(stdout);
         hc_post(x_multi, attn_out, residual, post, comb, hc, dim);
-        free(attn_out);
+
         
         // --- 2. FFN / MoE Block ---
         memcpy(residual, x_multi, hc_dim * sizeof(float));
-        
-        // Shrink 4 streams -> 1
-        hc_pre(x_single, x_multi, &l->hc_ffn_fn, l->hc_ffn_scale, l->hc_ffn_base, hc, dim, c->hc_sinkhorn_iters, c->eps, post, comb);
-        
-        // FFN Norm
+        hc_pre(x_single, x_multi, &l->hc_ffn_fn, l->hc_ffn_scale, l->hc_ffn_base,
+               hc, dim, c->hc_sinkhorn_iters, c->eps, post, comb);
         rmsnorm_slice(x_single, x_single, l->ffn_norm, dim, c->eps);
-        
-        // MoE Router
-        int *topk_idx = malloc(c->topk * sizeof(int));
-        float *topk_weights = falloc(c->topk);
-        moe_route(c, l, l_id, token_id, x_single, topk_idx, topk_weights);
         
         float *ffn_out = falloc(dim);
         memset(ffn_out, 0, dim * sizeof(float));
+        int inter = c->moe_inter;  // 2048
         
-        // Shared Expert
-        // (x @ w1) * w3 -> w2
-        // ffn_out += shared_expert(x)
+        // Shared Expert FFN
+        if (l->shared_w1.fmt != 0 || l->shared_w1.qf) {
+            float *sh_out = falloc(dim);
+            ffn_silu(sh_out, x_single, &l->shared_w1, &l->shared_w3, &l->shared_w2, dim, inter);
+            for (int d = 0; d < dim; d++) ffn_out[d] += sh_out[d];
+
+        }
         
-        // Routed Experts
+        // MoE Router
+        int *topk_idx = (int*)falloc(c->topk);
+        float *topk_weights = falloc(c->topk);
+        moe_route(c, l, l_id, token_id, x_single, topk_idx, topk_weights);
+        
+        // Routed Expert FFN
         for (int k = 0; k < c->topk; k++) {
             int e = topk_idx[k];
             float w = topk_weights[k];
-            // float *ex_out = run_expert(e, x_single);
-            // for(d) ffn_out[d] += w * ex_out[d];
-            (void)e; (void)w; // Suppress unused warnings
+            if (e < 0 || e >= c->n_experts) continue;
+            if (l->ex_w1[e].fmt == 0 && !l->ex_w1[e].qf) continue;
+            
+            float *ex_out = falloc(dim);
+            ffn_silu(ex_out, x_single, &l->ex_w1[e], &l->ex_w3[e], &l->ex_w2[e], dim, inter);
+            for (int d = 0; d < dim; d++) ffn_out[d] += w * ex_out[d];
+
         }
         
-        // Expand 1 -> 4 streams and mix
         hc_post(x_multi, ffn_out, residual, post, comb, hc, dim);
-        
-        free(topk_idx); free(topk_weights); free(ffn_out);
+
     }
     
-    // --- 3. Final Head (MTP/LM) ---
-    // hc_head(x_multi) -> shrink to 1 using hc_head_fn/scale/base
-    // Then norm, then mm(lm_head).
+    // --- 3. Final Head: hc_head shrink → RMSNorm → LM Head ---
+    printf("DEBUG: Final Head\n"); fflush(stdout);
+    // Shrink hc streams to 1 using hc_head_fn/scale/base
+    float *hc_post_buf = falloc(hc);
+    float *hc_comb_buf = falloc(hc * hc);
+    hc_pre(x_single, x_multi, &m->hc_head_fn, m->hc_head_scale, m->hc_head_base,
+           hc, dim, c->hc_sinkhorn_iters, c->eps, hc_post_buf, hc_comb_buf);
+    // End of Final HeadRMSNorm
+    rmsnorm_slice(x_single, x_single, m->final_norm, dim, c->eps);
     
-    free(x_multi); free(x_single); free(residual); free(post); free(comb);
+    // LM Head: x_single[4096] → logits[vocab_size]
+    matmul_qt(logits, x_single, &m->lm_head, 1);
+    
+
 }
 
 /* ---------- config loader ---------- */
@@ -598,15 +676,14 @@ static void load_cfg(Cfg *c, const char *snap) {
     c->hidden       = (int)json_get(r,"hidden_size")->num;
     c->n_layers     = (int)json_get(r,"num_hidden_layers")->num;
     c->n_heads      = (int)json_get(r,"num_attention_heads")->num;
-    // c->n_kv_heads   = (int)json_get(r,"num_key_value_heads")->num;
     c->head_dim     = (int)json_get(r,"head_dim")->num;
+    c->vocab_size   = (int)json_get(r,"vocab_size")->num;
+    c->moe_inter    = (int)json_get(r,"moe_intermediate_size")->num;
     c->index_head_dim = (int)json_get(r,"index_head_dim")->num;
     c->index_n_heads = (int)json_get(r,"index_n_heads")->num;
     c->index_topk   = (int)json_get(r,"index_topk")->num;
     c->n_experts    = (int)json_get(r,"n_routed_experts")->num;
     c->topk         = (int)json_get(r,"num_experts_per_tok")->num;
-    // c->inter        = (int)json_get(r,"moe_intermediate_size")->num;
-    // c->vocab        = (int)json_get(r,"vocab_size")->num;
     c->n_hash_layers= (int)json_get(r,"num_hash_layers")->num;
     c->hc_mult      = (int)json_get(r,"hc_mult")->num;
     c->hc_sinkhorn_iters = (int)json_get(r,"hc_sinkhorn_iters")->num;
@@ -614,19 +691,21 @@ static void load_cfg(Cfg *c, const char *snap) {
     c->q_lora_rank  = (int)json_get(r,"q_lora_rank")->num;
     c->o_lora_rank  = (int)json_get(r,"o_lora_rank")->num;
     c->o_groups     = (int)json_get(r,"o_groups")->num;
-    c->kv_lora_rank = 512; // Hardcoded for DeepSeek V4-Flash
+    c->kv_lora_rank = c->head_dim;  // In DeepSeek V4 MLA, kv_lora_rank == head_dim == 512
     c->qk_rope_head_dim = (int)json_get(r,"qk_rope_head_dim")->num;
     
     jval *th = json_get(r,"rope_theta");   c->theta = th ? (float)th->num : 10000.f;
     jval *ep = json_get(r,"rms_norm_eps"); c->eps   = ep ? (float)ep->num : 1e-6f;
     jval *hc = json_get(r,"hc_eps");       c->hc_eps= hc ? (float)hc->num : 1e-6f;
-    // jval *nt = json_get(r,"norm_topk_prob"); c->norm_topk = (nt && nt->t==J_BOOL) ? nt->boolean : 0;
     
     jval *cr = json_get(r,"compress_ratios");
     if (cr && cr->t == J_ARR) {
         c->compress_ratios = malloc(cr->len * sizeof(int));
         for (int i = 0; i < cr->len; i++) c->compress_ratios[i] = (int)cr->kids[i]->num;
     }
+    
+    printf("  Config: hidden=%d layers=%d heads=%d hd=%d vocab=%d moe_inter=%d experts=%d topk=%d\n",
+           c->hidden, c->n_layers, c->n_heads, c->head_dim, c->vocab_size, c->moe_inter, c->n_experts, c->topk);
     
     free(buf); free(arena);
 }
