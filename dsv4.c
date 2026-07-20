@@ -432,12 +432,55 @@ static void attention_decode(Model *m, Layer *l, int layer_id, float *x, int pos
         rope_head(qh, pos, c);
     }
     
+    int ratio = c->compress_ratios ? c->compress_ratios[layer_id] : 0;
+    
     // Store KV latent in sliding window cache
     int t_pos = pos % win;
     memcpy(m->K[layer_id] + t_pos * kvd, kv, kvd * sizeof(float));
     memcpy(m->V[layer_id] + t_pos * kvd, kv, kvd * sizeof(float));
     
     int t_max = pos + 1 < win ? pos + 1 : win;
+    int num_blocks = 0;
+    int *selected_blocks = NULL;
+    
+    if (ratio > 0) {
+        // Mock Token Compression
+        if (pos > 0 && pos % ratio == 0) {
+            int block_idx = (pos / ratio) - 1;
+            if (block_idx < 4096) {
+                // simple average of the last `ratio` tokens
+                float *comp_kv = falloc(kvd);
+                memset(comp_kv, 0, kvd * sizeof(float));
+                for(int i=0; i<ratio; i++) {
+                    int p = (pos - i) % win;
+                    for(int d=0; d<kvd; d++) comp_kv[d] += m->K[layer_id][p*kvd + d] / ratio;
+                }
+                memcpy(m->K[layer_id] + (win + block_idx) * kvd, comp_kv, kvd * sizeof(float));
+                memcpy(m->V[layer_id] + (win + block_idx) * kvd, comp_kv, kvd * sizeof(float));
+            }
+        }
+        
+        // Mock Lightning Indexer logic for CSA
+        if (ratio == 4) {
+            int max_blocks = pos / ratio;
+            if (max_blocks > 4096) max_blocks = 4096;
+            
+            int topk = c->index_topk > 0 ? c->index_topk : 512;
+            if (topk > max_blocks) topk = max_blocks;
+            
+            if (topk > 0) {
+                selected_blocks = (int*)falloc(topk);
+                // Select the most recent compressed blocks
+                for(int b=0; b<topk; b++) selected_blocks[b] = max_blocks - 1 - b;
+                num_blocks = topk;
+            }
+        } else {
+            // HCA (ratio=128) - dense attention over all blocks
+            num_blocks = pos / ratio;
+            if (num_blocks > 4096) num_blocks = 4096;
+        }
+    }
+    
     float scale = 1.0f / sqrtf((float)hd);
     
     // Per-head attention in the kv_lora_rank=512 latent space
@@ -445,7 +488,7 @@ static void attention_decode(Model *m, Layer *l, int layer_id, float *x, int pos
     for (int hh = 0; hh < H; hh++) {
         float *qh = q_heads + hh * hd;
         float *oh = o_heads + hh * hd;
-        float *scores = falloc(t_max);
+        float *scores = falloc(t_max + num_blocks);
         
         float max_score = -1e9f;
         for (int t = 0; t < t_max; t++) {
@@ -453,14 +496,24 @@ static void attention_decode(Model *m, Layer *l, int layer_id, float *x, int pos
             float score = 0;
             for (int i = 0; i < kvd; i++) score += qh[i] * kt[i];
             score *= scale;
-            // Add attention sink bias if available
             if (l->attn_sink) score += l->attn_sink[hh];
             scores[t] = score;
             if (score > max_score) max_score = score;
         }
         
+        for (int b = 0; b < num_blocks; b++) {
+            int block_idx = (ratio == 4) ? selected_blocks[b] : b;
+            float *kt = m->K[layer_id] + (win + block_idx) * kvd;
+            float score = 0;
+            for (int i = 0; i < kvd; i++) score += qh[i] * kt[i];
+            score *= scale;
+            if (l->attn_sink) score += l->attn_sink[hh];
+            scores[t_max + b] = score;
+            if (score > max_score) max_score = score;
+        }
+        
         float sum_exp = 0;
-        for (int t = 0; t < t_max; t++) {
+        for (int t = 0; t < t_max + num_blocks; t++) {
             scores[t] = expf(scores[t] - max_score);
             sum_exp += scores[t];
         }
@@ -469,6 +522,12 @@ static void attention_decode(Model *m, Layer *l, int layer_id, float *x, int pos
         for (int t = 0; t < t_max; t++) {
             float w = scores[t] / sum_exp;
             float *vt = m->V[layer_id] + t * kvd;
+            for (int i = 0; i < kvd; i++) oh[i] += w * vt[i];
+        }
+        for (int b = 0; b < num_blocks; b++) {
+            int block_idx = (ratio == 4) ? selected_blocks[b] : b;
+            float w = scores[t_max + b] / sum_exp;
+            float *vt = m->V[layer_id] + (win + block_idx) * kvd;
             for (int i = 0; i < kvd; i++) oh[i] += w * vt[i];
         }
     }
@@ -728,8 +787,9 @@ static void model_init(Model *m, const char *snap) {
     m->K = calloc(m->c.n_layers, sizeof(float*));
     m->V = calloc(m->c.n_layers, sizeof(float*));
     for (int i=0; i<m->c.n_layers; i++) {
-        m->K[i] = calloc(m->c.window_size * m->c.kv_lora_rank, sizeof(float));
-        m->V[i] = calloc(m->c.window_size * m->c.kv_lora_rank, sizeof(float));
+        int max_compressed_blocks = 4096;
+        m->K[i] = calloc((m->c.window_size + max_compressed_blocks) * m->c.kv_lora_rank, sizeof(float));
+        m->V[i] = calloc((m->c.window_size + max_compressed_blocks) * m->c.kv_lora_rank, sizeof(float));
     }
     
     printf("Connecting tensor architecture...\n");
