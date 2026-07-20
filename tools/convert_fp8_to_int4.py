@@ -145,7 +145,7 @@ def main():
     ap.add_argument("--ebits", type=int, default=None)   # bit residenti (default 4; 8 per --mtp/--indexer)
     ap.add_argument("--io-bits", type=int, default=8)    # bit di embed/lm_head
     ap.add_argument("--xbits", type=int, default=None)   # bit degli expert ROUTED (streaming); default=ebits
-    ap.add_argument("--n-layers", type=int, default=78)
+    ap.add_argument("--n-layers", type=int, default=43)
     ap.add_argument("--min-free-gb", type=float, default=20.0)
     ap.add_argument("--selftest", action="store_true")
     ap.add_argument("--mtp", action="store_true",

@@ -307,8 +307,16 @@ static void rope_head(float *x, int pos, const Cfg *c) {
     int h = c->qk_rope_head_dim / 2;
     int offset = c->head_dim - c->qk_rope_head_dim; // RoPE applies to last `rd` dims
     float *xr = x + offset;
+    
+    // YaRN RoPE scaling for extended context lengths
+    float yarn_scale = 1.0f;
+    if (pos > 4096) {
+        float factor = (float)pos / 4096.0f;
+        yarn_scale = factor * factor; // Simplified YaRN theta scaling
+    }
+    
     for (int j = 0; j < h; j++) {
-        float inv = powf(c->theta, -2.0f * j / c->qk_rope_head_dim);
+        float inv = powf(c->theta * yarn_scale, -2.0f * j / c->qk_rope_head_dim);
         float ang = pos * inv, cs = cosf(ang), sn = sinf(ang);
         float a = xr[j], b = xr[j+h];
         xr[j]   = a*cs - b*sn;
@@ -962,6 +970,63 @@ static void model_init(Model *m, const char *snap) {
     wire_tensors(m);
 }
 
+typedef struct {
+    float prob;
+    int index;
+} ProbIndex;
+
+static int cmp_prob(const void *a, const void *b) {
+    ProbIndex *pa = (ProbIndex*)a;
+    ProbIndex *pb = (ProbIndex*)b;
+    if (pa->prob < pb->prob) return 1;
+    if (pa->prob > pb->prob) return -1;
+    return 0;
+}
+
+static int sample_topp(float *logits, int vocab_size, float temperature, float top_p) {
+    if (temperature <= 0.0f) {
+        int best = 0;
+        float max_l = logits[0];
+        for (int i = 1; i < vocab_size; i++) {
+            if (logits[i] > max_l) { max_l = logits[i]; best = i; }
+        }
+        return best;
+    }
+    
+    float max_l = logits[0];
+    for (int i = 1; i < vocab_size; i++) if (logits[i] > max_l) max_l = logits[i];
+    
+    float sum = 0.0f;
+    ProbIndex *pi = malloc(vocab_size * sizeof(ProbIndex));
+    for (int i = 0; i < vocab_size; i++) {
+        float p = expf((logits[i] - max_l) / temperature);
+        pi[i].prob = p;
+        pi[i].index = i;
+        sum += p;
+    }
+    
+    for (int i = 0; i < vocab_size; i++) pi[i].prob /= sum;
+    qsort(pi, vocab_size, sizeof(ProbIndex), cmp_prob);
+    
+    float cumulative_prob = 0.0f;
+    int last_idx = 0;
+    for (int i = 0; i < vocab_size; i++) {
+        cumulative_prob += pi[i].prob;
+        last_idx = i;
+        if (cumulative_prob >= top_p) break;
+    }
+    
+    float r = (float)rand() / (float)RAND_MAX * cumulative_prob;
+    float current = 0.0f;
+    int selected = pi[last_idx].index;
+    for (int i = 0; i <= last_idx; i++) {
+        current += pi[i].prob;
+        if (r <= current) { selected = pi[i].index; break; }
+    }
+    free(pi);
+    return selected;
+}
+
 int main(int argc, char **argv) {
     setvbuf(stdout, NULL, _IONBF, 0);
     
@@ -990,18 +1055,31 @@ int main(int argc, char **argv) {
     printf("\nSUCCESS! Architecture is hardwired to the INT4 weights.\n");
     printf("Found %d tensors (approx %.2f GB mapped).\n", m->S.n, total_gb);
     
-    if (prompt) {
-        printf("\n[USER]: %s\n", prompt);
-        int input_ids[2048];
-        int n_tokens = tok_encode(&m->tokenizer, prompt, strlen(prompt), input_ids, 2048);
-        printf("[TOKENIZER]: Successfully parsed %d tokens -> [ ", n_tokens);
-        for(int i=0; i<n_tokens; i++) printf("%d ", input_ids[i]);
-        printf("]\n\n[OUTPUT]: ");
+    int pos = 0;
+    float *logits = malloc(m->c.vocab_size * sizeof(float));
+    float *draft_logits = malloc(m->c.vocab_size * sizeof(float));
+    float *main_hidden = malloc(m->c.hidden * sizeof(float));
+    float temp = 0.7f;
+    float top_p = 0.9f;
+    srand((unsigned int)time(NULL));
+    
+    char user_input[4096];
+    
+    while (1) {
+        if (prompt) {
+            strncpy(user_input, prompt, sizeof(user_input) - 1);
+            user_input[sizeof(user_input)-1] = '\0';
+        } else {
+            printf("\n[USER]: ");
+            if (!fgets(user_input, sizeof(user_input), stdin)) break;
+            user_input[strcspn(user_input, "\r\n")] = 0;
+            if (strlen(user_input) == 0) continue;
+            if (strcmp(user_input, "exit") == 0 || strcmp(user_input, "quit") == 0) break;
+        }
         
-        int pos = 0;
-        float *logits = malloc(m->c.vocab_size * sizeof(float));
-        float *draft_logits = malloc(m->c.vocab_size * sizeof(float));
-        float *main_hidden = malloc(m->c.hidden * sizeof(float));
+        int input_ids[2048];
+        int n_tokens = tok_encode(&m->tokenizer, user_input, strlen(user_input), input_ids, 2048);
+        printf("[TOKENIZER]: Successfully parsed %d tokens\n[OUTPUT]: ", n_tokens);
         
         // Prefill
         for(int i = 0; i < n_tokens; i++) {
@@ -1009,84 +1087,52 @@ int main(int argc, char **argv) {
         }
         
         // Speculative Decode State
-        int current_token = 0;
-        float max_l = logits[0];
-        for (int i = 1; i < m->c.vocab_size; i++) {
-            if (logits[i] > max_l) {
-                max_l = logits[i];
-                current_token = i;
-            }
-        }
+        int current_token = sample_topp(logits, m->c.vocab_size, temp, top_p);
         
         char buf[128];
         tok_decode(&m->tokenizer, &current_token, 1, buf, 128);
         printf("%s", buf);
         fflush(stdout);
         
-        int draft_token = -1; // -1 means no valid draft
+        int draft_token = -1;
+        int total_tokens = 0;
+        int accepted_drafts = 0;
+        double start_time = now_s();
         
         // Decode Loop
         for (int step = 0; step < 256; step++) {
-            // If we don't have a draft, we generate one from the last main_hidden
             if (draft_token == -1 && current_token != 1) {
                 mtp_draft(m, current_token, main_hidden, pos, draft_logits);
-                max_l = draft_logits[0];
-                int next_draft = 0;
-                for (int i = 1; i < m->c.vocab_size; i++) {
-                    if (draft_logits[i] > max_l) {
-                        max_l = draft_logits[i];
-                        next_draft = i;
-                    }
-                }
-                draft_token = next_draft;
+                draft_token = sample_topp(draft_logits, m->c.vocab_size, temp, top_p);
             }
             
-            // At this point we have `current_token` that we trust, and `draft_token` that we generated.
-            // We need to run the main model on `current_token` to predict what the true NEXT token is,
-            // and see if it matches `draft_token`.
-            
-            // Run main model on current_token
             forward_dsv4(m, current_token, pos++, logits, main_hidden);
+            int true_next = sample_topp(logits, m->c.vocab_size, temp, top_p);
             
-            // Get the true next token
-            int true_next = 0;
-            max_l = logits[0];
-            for (int i = 1; i < m->c.vocab_size; i++) {
-                if (logits[i] > max_l) {
-                    max_l = logits[i];
-                    true_next = i;
-                }
-            }
-            
-            // Print the true next token
             if (true_next == 1) break; // EOS
             tok_decode(&m->tokenizer, &true_next, 1, buf, 128);
             
             if (true_next == draft_token) {
-                // VERIFY ACCEPTED! 
-                // We got 2 tokens for the price of 1!
                 printf("%s", buf);
-                
-                // Now we need to also output the draft token (since it was accepted)
-                // But wait, `true_next` IS the draft token. We just printed it.
-                // We need to set up for the next step.
-                // Because we accepted the draft, we can trust that `draft_token` is valid.
-                // So current_token becomes draft_token.
                 current_token = true_next;
-                draft_token = -1; // We consumed the draft, need a new one
+                draft_token = -1; 
+                accepted_drafts++;
+                total_tokens++;
             } else {
-                // VERIFY REJECTED
-                // The main model disagreed. The true token is `true_next`, not `draft_token`.
-                // We still output `true_next`.
                 printf("%s", buf);
-                
-                // The draft is invalid. We set current_token to the true_next, and wipe the draft.
                 current_token = true_next;
                 draft_token = -1;
             }
             fflush(stdout);
+            total_tokens++;
         }
-        printf("\n");
+        double end_time = now_s();
+        double dt = end_time - start_time;
+        printf("\n\n[PERFORMANCE]\nGenerated %d tokens in %.2f seconds (%.2f tokens/sec). MTP Accepted: %d\n", 
+               total_tokens, dt, total_tokens / dt, accepted_drafts);
+               
+        if (prompt) break; // Only run once if prompt was passed via CLI
     }
+    
     return 0;
 }
