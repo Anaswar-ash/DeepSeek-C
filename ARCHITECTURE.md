@@ -40,8 +40,32 @@ The C engine utilizes **OpenMP** to split the matrix multiplication math across 
 
 ---
 
-## Summary of the Generation Loop
+## 3. Flowchart: The Generation Loop
 When you type a prompt, the engine executes this loop for every single word:
+
+```mermaid
+graph TD
+    A[User Input] --> B[Tokenizer]
+    B --> C{For Each Layer 1 to 43}
+    
+    C --> D[Attention Block]
+    D --> E[mHC Pre-Norm]
+    E --> F[Expert Routing Module]
+    F -->|Activate Top-6 Experts| G[Stream Expert Weights from SSD]
+    G --> H[OpenMP SIMD Matrix Multiplication]
+    H --> I[mHC Post-Norm]
+    I --> J{More Layers?}
+    
+    J -->|Yes| C
+    J -->|No| K[Final RMSNorm]
+    K --> L[LM Head Projection]
+    L --> M[Next Token Sampled]
+    M --> N{Generation Complete?}
+    
+    N -->|No| B
+    N -->|Yes| O[Final Text Output]
+```
+
 1. **Tokenize** the input.
 2. **Stream** the active expert weights (6.5 GB of data) from the external SSD into the CPU.
 3. **Multiply** the weights using OpenMP multithreading.
