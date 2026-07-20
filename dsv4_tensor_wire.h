@@ -132,7 +132,7 @@ static void wire_tensors(Model *m) {
         qt_load(S, &l->wkv, snprintf(buf, sizeof(buf), "layers.%d.attn.wkv.weight", i) ? buf : buf, 0, dim);
         l->kv_norm = fp32_load(S, snprintf(buf, sizeof(buf), "layers.%d.attn.kv_norm.weight", i) ? buf : buf);
         
-        qt_load(S, &l->wo_a, snprintf(buf, sizeof(buf), "layers.%d.attn.wo_a.weight", i) ? buf : buf, 0, m->c.o_lora_rank);
+        qt_load(S, &l->wo_a, snprintf(buf, sizeof(buf), "layers.%d.attn.wo_a.weight", i) ? buf : buf, 0, (m->c.n_heads * m->c.head_dim) / m->c.o_groups);
         qt_load(S, &l->wo_b, snprintf(buf, sizeof(buf), "layers.%d.attn.wo_b.weight", i) ? buf : buf, dim, 0);
         
         l->hc_attn_base = fp32_load(S, snprintf(buf, sizeof(buf), "layers.%d.hc_attn_base", i) ? buf : buf);
@@ -142,5 +142,13 @@ static void wire_tensors(Model *m) {
         l->hc_ffn_base = fp32_load(S, snprintf(buf, sizeof(buf), "layers.%d.hc_ffn_base", i) ? buf : buf);
         l->hc_ffn_scale = fp32_load(S, snprintf(buf, sizeof(buf), "layers.%d.hc_ffn_scale", i) ? buf : buf);
         qt_load(S, &l->hc_ffn_fn, snprintf(buf, sizeof(buf), "layers.%d.hc_ffn_fn", i) ? buf : buf, (2 + m->c.hc_mult) * m->c.hc_mult, m->c.hc_mult * dim);
+
+        // Indexer loading
+        qt_load(S, &l->idx_ape, snprintf(buf, sizeof(buf), "layers.%d.attn.indexer.compressor.ape", i) ? buf : buf, 0, 0);
+        l->idx_comp_norm = fp32_load(S, snprintf(buf, sizeof(buf), "layers.%d.attn.indexer.compressor.norm.weight", i) ? buf : buf);
+        qt_load(S, &l->idx_wgate, snprintf(buf, sizeof(buf), "layers.%d.attn.indexer.compressor.wgate.weight", i) ? buf : buf, 0, 0);
+        qt_load(S, &l->idx_wkv, snprintf(buf, sizeof(buf), "layers.%d.attn.indexer.compressor.wkv.weight", i) ? buf : buf, 0, 0);
+        qt_load(S, &l->idx_wproj, snprintf(buf, sizeof(buf), "layers.%d.attn.indexer.weights_proj.weight", i) ? buf : buf, 0, 0);
+        qt_load(S, &l->idx_wq_b, snprintf(buf, sizeof(buf), "layers.%d.attn.indexer.wq_b.weight", i) ? buf : buf, 0, 0);
     }
 }

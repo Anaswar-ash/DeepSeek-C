@@ -70,11 +70,14 @@ def layer_idx(name):
     if len(p) > 2 and p[0] == "model" and p[1] == "layers":
         try: return int(p[2])
         except ValueError: return -1
+    elif len(p) > 1 and p[0] == "layers":
+        try: return int(p[1])
+        except ValueError: return -1
     return -1
 
 def classify(name, n_layers, keep_mtp=False, keep_idx=False):
-    if name.endswith("_scale_inv"): return "consumed"   # gestito col suo peso
     li = layer_idx(name)
+    if "_scale_inv" in name or ".scale" in name: return "consumed"
     if keep_idx:
         # modalita' --indexer: SOLO i pesi del DSA lightning indexer dei layer principali
         if li < 0 or li >= n_layers or "indexer" not in name: return "skip"
@@ -214,10 +217,16 @@ def main():
     from huggingface_hub import HfApi, hf_hub_download
 
     # lock anti-doppione: DUE convertitori sulla stessa outdir si corrompono a vicenda.
-    # EN: anti-duplicate lock: TWO converters on the same outdir corrupt each other.
-    import fcntl
-    lock = open(os.path.join(a.outdir, ".convert.lock"), "w")
-    try: fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    lock_path = os.path.join(a.outdir, ".convert.lock")
+    try:
+        if os.name == 'nt':
+            import msvcrt
+            lock = open(lock_path, "w")
+            msvcrt.locking(lock.fileno(), msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+            lock = open(lock_path, "w")
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except OSError:
         print("ERROR: another converter is already using this output directory. Exiting."); return
 
@@ -415,24 +424,91 @@ def main():
         shutil.rmtree(tmp, ignore_errors=True); print("[MTP] DONE."); return
     if a.indexer:
         import urllib.request
+        import struct
+        import torch
         idx = json.loads(urllib.request.urlopen(
             f"https://huggingface.co/{a.repo}/resolve/main/model.safetensors.index.json", timeout=30).read())["weight_map"]
         idx_shards = sorted(set(v for k, v in idx.items()
                                 if "indexer" in k and 0 <= layer_idx(k) < a.n_layers))
-        tot_gb = len(idx_shards) * 5.4
-        print(f"[IDX] indexer weights across {len(idx_shards)} shards (~{tot_gb:.0f} GB total download, resumable)")
+        print(f"[IDX] surgical downloading indexer weights across {len(idx_shards)} shards...")
         for i, sh in enumerate(idx_shards):
             outp = os.path.join(a.outdir, f"out-idx-{i:05d}.safetensors")
-            if os.path.exists(outp): continue             # gia' fatto -> ripartibile
-            print(f"[IDX {i+1}/{len(idx_shards)}] downloading {sh}...", flush=True)
-            p = download_retry(a.repo, sh, tmp)
-            out = {}; convert_shard(p, out, a.n_layers, a.ebits, a.io_bits, a.xbits, keep_idx=True)
+            if os.path.exists(outp): continue
+            print(f"[IDX {i+1}/{len(idx_shards)}] surgically fetching from {sh}...", flush=True)
+            
+            url = f"https://huggingface.co/{a.repo}/resolve/main/{sh}"
+            req = urllib.request.Request(url, headers={"Range": "bytes=0-7", "User-Agent": "colibri-convert"})
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                length = struct.unpack('<Q', resp.read())[0]
+                
+            req = urllib.request.Request(url, headers={"Range": f"bytes=8-{8+length-1}", "User-Agent": "colibri-convert"})
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                header = json.loads(resp.read().decode('utf-8'))
+                
+            out = {}
+            for name in header.keys():
+                if "indexer" not in name: continue
+                kind = classify(name, a.n_layers, keep_mtp=False, keep_idx=True)
+                if kind in ("skip", "consumed"): continue
+                
+                info = header[name]
+                offsets = info["data_offsets"]
+                byte_start = 8 + length + offsets[0]
+                byte_end = 8 + length + offsets[1] - 1
+                
+                req = urllib.request.Request(url, headers={"Range": f"bytes={byte_start}-{byte_end}", "User-Agent": "colibri-convert"})
+                with urllib.request.urlopen(req, timeout=30) as resp:
+                    data = resp.read()
+                    
+                dt = info["dtype"]
+                shape = tuple(info["shape"])
+                if dt in ("F8_E4M3", "float8_e4m3fn"):
+                    scale_name = name + "_scale_inv"
+                    if scale_name not in header:
+                        scale_name = name.replace(".weight", ".scale")
+                    s_info = header[scale_name]
+                    s_off = s_info["data_offsets"]
+                    s_start = 8 + length + s_off[0]
+                    s_end = 8 + length + s_off[1] - 1
+                    
+                    req2 = urllib.request.Request(url, headers={"Range": f"bytes={s_start}-{s_end}", "User-Agent": "colibri-convert"})
+                    with urllib.request.urlopen(req2, timeout=15) as resp2:
+                        s_data = resp2.read()
+                        
+                    w_raw = torch.frombuffer(bytearray(data), dtype=torch.float8_e4m3fn).view(shape).to(torch.float32)
+                    s_dt = s_info["dtype"]
+                    s_dtype = torch.float8_e8m0fnu if s_dt == "F8_E8M0" else torch.float32
+                    s_raw = torch.frombuffer(bytearray(s_data), dtype=s_dtype).view(tuple(s_info["shape"])).to(torch.float32)
+                    
+                    O, I = w_raw.shape
+                    if s_raw.ndim == 2:
+                        sc = s_raw.repeat_interleave(128, 0).repeat_interleave(128, 1)[:O, :I]
+                    elif s_raw.ndim == 1:
+                        sc = s_raw.unsqueeze(1).expand(O, I)
+                    w = (w_raw * sc).numpy()
+                elif dt == "BF16":
+                    w = torch.frombuffer(bytearray(data), dtype=torch.bfloat16).view(shape).to(torch.float32).numpy()
+                elif dt == "F32":
+                    w = torch.frombuffer(bytearray(data), dtype=torch.float32).view(shape).numpy()
+                else:
+                    raise ValueError(f"Unknown dtype {dt}")
+                    
+                if kind == "f32":
+                    out[name] = w.astype(np.float32)
+                else:
+                    bits = a.io_bits if kind == "io" else a.xbits if kind == "x" else a.ebits
+                    if w.ndim != 2:
+                        out[name] = w.astype(np.float32)
+                    else:
+                        q, s = (quant_int2(w, bits) if bits <= 2 else
+                                quant_int4(w, bits) if bits <= 4 else quant_int8(w, bits))
+                        out[name] = q
+                        out[name + ".qs"] = s
+            
             if out: save_file(out, outp)
-            os.remove(p)
-            for blob in glob.glob(os.path.join(tmp, "**", "*"), recursive=True):
-                if os.path.isfile(blob): os.remove(blob)
-            print(f"    -> {os.path.basename(outp)} ({len(out)} tensors)", flush=True)
-        shutil.rmtree(tmp, ignore_errors=True); print("[IDX] DONE."); return
+            print(f"    -> {os.path.basename(outp)} ({len(out)} tensors surgically extracted)", flush=True)
+            
+        print("[IDX] DONE."); return
     for i, sh in enumerate(shards):
         if free_gb(a.outdir) < a.min_free_gb:
             print(f"STOP: free space is below {a.min_free_gb} GB. Free space and rerun to resume."); break
