@@ -12,11 +12,16 @@ DeepSeek-V4 is a state-of-the-art "Frontier" class Large Language Model. Unlike 
 *   **Active Parameters:** 13 Billion per token
 *   **Context Length:** 1 Million tokens
 *   **Native Precision:** FP8 (8-bit floating point) Mixed
+*   **Layers:** 43 transformer blocks
+*   **Experts:** 256 routed + 1 shared, top-6 activated per token
 
 ### Architectural Innovations:
-*   **MoE Routing:** Instead of a standard feed-forward layer, V4 uses a gating network that routes tokens to specific "expert" neural networks. V4 utilizes sigmoid-based top-k routing to selectively activate only the 13B parameters needed for a given token, saving massive amounts of compute.
-*   **Attention Mechanism:** Utilizes variations of heavily compressed latent attention (such as MLA/CSA) to drastically reduce the size of the KV-Cache, allowing for massive context lengths without exploding memory requirements.
-*   **mHC (Manifold-Constrained Hyper-Connections):** A novel residual connection technique utilizing Sinkhorn-Knopp normalization to stabilize the outputs of the sparse experts before they rejoin the main data stream.
+*   **MoE Routing:** Sigmoid-based `sqrtsoftplus` scoring selects the top-6 experts per token. The first 3 layers use deterministic hash routing for stability.
+*   **Multi-head Latent Attention (MLA):** Q and KV projections go through a low-rank bottleneck (`q_lora_rank=1024`, `kv_lora_rank=512`) to dramatically reduce KV cache size.
+*   **Compressed Sparse Attention (CSA):** Layers with `compress_ratio=4` compress every 4 tokens into 1 compressed KV block. A **Lightning Indexer** neural network scores all compressed blocks and selects the top-512 most relevant ones for attention.
+*   **Heavily Compressed Attention (HCA):** Layers with `compress_ratio=128` compress 128 tokens into 1 block. Dense attention over all available blocks (no top-k selection needed since there are very few blocks).
+*   **mHC (Manifold-Constrained Hyper-Connections):** A novel residual connection technique utilizing Sinkhorn-Knopp normalization across 4 parallel streams (`hc_mult=4`) to stabilize the outputs of the sparse experts before they rejoin the main data stream.
+*   **Grouped Output Projection:** The attention output is split into 8 groups (`o_groups=8`), each independently projected through `wo_a[1024, 4096]`, then concatenated and projected back through `wo_b[4096, 8192]`.
 
 ---
 
@@ -38,6 +43,9 @@ To speed up the SSD streaming, the FP8 model is compressed down to 4-bit integer
 ### Multithreading
 The C engine utilizes **OpenMP** to split the matrix multiplication math across all available CPU cores. It leverages `AVX2` instruction sets to multiply the 4-bit integers rapidly without needing a dedicated Graphics Card (GPU).
 
+### Lightning Indexer
+For CSA layers (compress_ratio=4), the engine uses the downloaded indexer weights (`idx_wq_b`, `idx_wproj`) to perform a lightweight neural-network query that scores all compressed KV blocks and selects the top-512 most relevant ones. This replaces the earlier mock fallback that just picked the most recent blocks sequentially.
+
 ---
 
 ## 3. Flowchart: The Generation Loop
@@ -45,29 +53,61 @@ When you type a prompt, the engine executes this loop for every single word:
 
 ```mermaid
 graph TD
-    A[User Input] --> B[Tokenizer]
-    B --> C{For Each Layer 1 to 43}
+    A["User Input"] --> B["Tokenizer (BPE)"]
+    B --> C["Embed Lookup (INT4 → float)"]
+    C --> D["Replicate into 4 mHC streams"]
     
-    C --> D[Attention Block]
-    D --> E[mHC Pre-Norm]
-    E --> F[Expert Routing Module]
-    F -->|Activate Top-6 Experts| G[Stream Expert Weights from SSD]
-    G --> H[OpenMP SIMD Matrix Multiplication]
-    H --> I[mHC Post-Norm]
-    I --> J{More Layers?}
+    D --> E{{"For Each Layer (1 to 43)"}}
     
-    J -->|Yes| C
-    J -->|No| K[Final RMSNorm]
-    K --> L[LM Head Projection]
-    L --> M[Next Token Sampled]
-    M --> N{Generation Complete?}
+    E --> F["mHC Pre (Sinkhorn-Knopp) → x_single"]
+    F --> G["RMSNorm"]
+    G --> H["Q Projection: wq_a → norm → wq_b"]
+    H --> I["KV Projection: wkv → norm"]
+    I --> J["RoPE (Rotary Position Encoding)"]
+    J --> K{"Compression Ratio?"}
     
-    N -->|No| B
-    N -->|Yes| O[Final Text Output]
+    K -->|"ratio=0 (SWA)"| L["Sliding Window Attention"]
+    K -->|"ratio=4 (CSA)"| M["Lightning Indexer → Top-512 Block Selection"]
+    K -->|"ratio=128 (HCA)"| N["Dense Compressed Attention"]
+    
+    L --> O["Softmax → Weighted Sum"]
+    M --> O
+    N --> O
+    
+    O --> P["Grouped Output Projection (wo_a × 8 groups → wo_b)"]
+    P --> Q["mHC Post (Expand + Residual Mix)"]
+    
+    Q --> R["mHC Pre → RMSNorm"]
+    R --> S["Shared Expert FFN (SiLU-gated)"]
+    R --> T["MoE Router → Top-6 Expert Selection"]
+    T --> U["Stream Expert Weights from SSD"]
+    U --> V["6× Expert FFN (SiLU-gated)"]
+    S --> W["Sum Expert Outputs"]
+    V --> W
+    W --> X["mHC Post (Expand + Residual Mix)"]
+    
+    X --> Y{{"More Layers?"}}
+    Y -->|Yes| E
+    Y -->|No| Z["hc_head (Sinkhorn → shrink to 1 stream)"]
+    Z --> AA["Final RMSNorm"]
+    AA --> AB["LM Head (INT4 matmul → 129,280 logits)"]
+    AB --> AC["Greedy Argmax → Next Token"]
+    AC --> AD{{"EOS?"}}
+    AD -->|No| E
+    AD -->|Yes| AE["Final Text Output"]
 ```
 
-1. **Tokenize** the input.
-2. **Stream** the active expert weights (6.5 GB of data) from the external SSD into the CPU.
-3. **Multiply** the weights using OpenMP multithreading.
-4. **Normalize** the outputs via mHC.
-5. **Output** the highest-probability next token.
+---
+
+## 4. File Structure
+
+| File | Purpose |
+|------|---------|
+| `dsv4.c` | Core inference engine (~855 lines) |
+| `dsv4_tensor_wire.h` | Maps safetensors names to C structs |
+| `math_dsv4.h` | INT4/INT8 SIMD matmul kernels |
+| `st.h` | Safetensors file parser and mmap loader |
+| `tok.h` | BPE tokenizer |
+| `json.h` | Minimal JSON parser |
+| `compat.h` | Windows/Linux compatibility |
+| `tools/convert_fp8_to_int4.py` | FP8→INT4 weight converter with surgical indexer download |

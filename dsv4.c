@@ -646,14 +646,8 @@ static void forward_dsv4(Model *m, int token_id, int pos, float *logits) {
         // Attention mechanism dispatch
         float *attn_out = falloc(dim);
         int ratio = c->compress_ratios[l_id];
-        if (ratio == 0) {
-            attention_decode(m, l, l_id, x_single, pos, attn_out);
-        } else {
-            // CSA / HCA
-            // Since lightning indexer weights are mocked/missing, fallback to dense 
-            // attention over the local window to preserve context and allow generation.
-            attention_decode(m, l, l_id, x_single, pos, attn_out);
-        }
+        // All ratio types (SWA/CSA/HCA) are dispatched inside attention_decode
+        attention_decode(m, l, l_id, x_single, pos, attn_out);
         
         hc_post(x_multi, attn_out, residual, post, comb, hc, dim);
 
@@ -790,13 +784,13 @@ int main(int argc, char **argv) {
     setvbuf(stdout, NULL, _IONBF, 0);
     
     if (argc < 2) {
-        printf("Usage: dsv4.exe <model_path> [-i prompt]\n");
+        printf("Usage: dsv4.exe <model_path> [-p prompt]\n");
         return 1;
     }
     
     char *prompt = NULL;
     for (int i=1; i<argc; i++) {
-        if (!strcmp(argv[i], "-i") && i+1 < argc) prompt = argv[i+1];
+        if ((!strcmp(argv[i], "-p") || !strcmp(argv[i], "-i")) && i+1 < argc) prompt = argv[i+1];
     }
     
     printf("==========================================\n");
@@ -831,7 +825,7 @@ int main(int argc, char **argv) {
         }
         
         // Decode
-        for (int step = 0; step < 30; step++) {
+        for (int step = 0; step < 256; step++) {
             int next = 0;
             float max_l = logits[0];
             for (int i=1; i<m->c.vocab_size; i++) {
@@ -840,6 +834,8 @@ int main(int argc, char **argv) {
                     next = i;
                 }
             }
+            
+            if (next == 1) break; // EOS token
             
             char buf[128];
             tok_decode(&m->tokenizer, &next, 1, buf, 128);

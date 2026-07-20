@@ -8,6 +8,7 @@ This engine bypasses the need for hundreds of gigabytes of RAM by streaming 4-bi
 - **Pure C Engine:** No bloated dependencies, no Python runtime required for generation.
 - **Memory Mapping (`mmap`):** Streams the 158B+ parameters directly from an SSD, requiring only a fraction of system RAM.
 - **Manifold-Constrained Hyper-Connections (mHC):** Full mathematical implementation of the Sinkhorn-Knopp normalization used in V4's residual streams.
+- **Lightning Indexer & Sparse Attention:** Accurate compressed KV cache selection using multi-head indexer projections, allowing the model to quickly route over 4000+ context blocks seamlessly.
 - **Dual-Routing MoE:** Supports both hash-based early expert routing and sigmoid-based top-k routing.
 - **Fast Multithreading:** AVX2/AVX-512 and OpenMP optimized matrix multiplication.
 - **Built-in Quantization:** Includes a multi-threaded Python downloading script that shrinks official FP8 HuggingFace weights down to 4-bit integer format on the fly.
@@ -32,14 +33,14 @@ Use the provided python tool to download the FP8 weights straight from HuggingFa
 *Note: You need `safetensors` and `huggingface_hub` installed (`pip install safetensors huggingface_hub`).*
 
 ```bash
-python tools/convert_dsv4.py --repo deepseek-ai/DeepSeek-V4-Flash-Base --outdir ./v4_int4
+python tools/convert_fp8_to_int4.py --hf_url deepseek-ai/DeepSeek-V4-Flash --out_dir ./v4_int4
 ```
 *(This will download roughly 150GB of data. Ensure you have adequate storage space!)*
 
 ### 3. Run the Model
 Once the conversion is complete, point the executable to your model directory and chat:
 ```bash
-./dsv4.exe ./v4_int4 -i "Write a story about a brilliant software engineer."
+./dsv4.exe ./v4_int4 -p "Write a story about a brilliant software engineer."
 ```
 
 ## Architecture Notes
