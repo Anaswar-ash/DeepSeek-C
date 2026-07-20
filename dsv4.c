@@ -95,6 +95,18 @@ typedef struct {
 typedef struct { int eid; int8_t *w1, *w2, *w3; float *w1s, *w2s, *w3s; uint64_t used; } Slot;
 typedef struct { Slot *slots; int n, cap; } LCache;
 
+/* ---------- MTP (Multi-Token Prediction) ---------- */
+typedef struct {
+    QT emb;           // mtp.0.emb.tok_emb.weight [vocab, hidden]
+    QT e_proj;        // mtp.0.e_proj.weight [hidden, hidden] — projects main hidden → MTP input
+    float *enorm;     // mtp.0.enorm.weight
+    float *hnorm;     // mtp.0.hnorm.weight
+    QT head;          // mtp.0.head.weight [vocab, hidden]
+    QT hc_head_fn;    // mtp.0.hc_head_fn
+    float *hc_head_base, *hc_head_scale;
+    Layer layer;      // The single MTP transformer layer (attn + MoE)
+} MTP;
+
 typedef struct {
     Cfg c;
     shards S;
@@ -112,6 +124,10 @@ typedef struct {
     int max_t;
     double dense_load_s;
     Tok tokenizer;
+    
+    // MTP
+    MTP *mtp;
+    int n_mtp;  // num_nextn_predict_layers (typically 1)
 } Model;
 
 /* ---------- utility ---------- */
@@ -390,23 +406,75 @@ static void attention_decode(Model *m, Layer *l, int layer_id, const float *x, i
     int *selected_blocks = NULL;
     
     if (ratio > 0) {
-        // Mock Token Compression
+        // Learned Token Compression using compressor weights
         if (pos > 0 && pos % ratio == 0) {
             int block_idx = (pos / ratio) - 1;
             if (block_idx < 4096) {
-                // simple average of the last `ratio` tokens
                 float *comp_kv = falloc(kvd);
-                memset(comp_kv, 0, kvd * sizeof(float));
-                for(int i=0; i<ratio; i++) {
-                    int p = (pos - i) % win;
-                    for(int d=0; d<kvd; d++) comp_kv[d] += m->K[layer_id][p*kvd + d] / ratio;
+                
+                if (l->idx_wkv.fmt > 0 && l->idx_wgate.fmt > 0) {
+                    // Learned compression: project each token's KV through wkv,
+                    // compute gating scores through wgate, softmax-weight the tokens
+                    float *gate_scores = falloc(ratio);
+                    float gate_max = -1e9f;
+                    
+                    for (int i = 0; i < ratio; i++) {
+                        int p = (pos - ratio + i) % win;
+                        float *tok_kv = m->K[layer_id] + p * kvd;
+                        
+                        // Gate score: single scalar from wgate projection
+                        float gs = 0;
+                        if (l->idx_wgate.fmt == 2 && l->idx_wgate.q4) {
+                            // Simple dot product with first row of wgate
+                            for (int d = 0; d < kvd && d < l->idx_wgate.I; d++) {
+                                uint8_t byte = l->idx_wgate.q4[d / 2];
+                                float v = ((d % 2 == 0) ? (byte & 0xF) : (byte >> 4)) - 8;
+                                gs += v * l->idx_wgate.s[0] * tok_kv[d];
+                            }
+                        } else {
+                            // Fallback: uniform weight
+                            gs = 0;
+                        }
+                        gate_scores[i] = gs;
+                        if (gs > gate_max) gate_max = gs;
+                    }
+                    
+                    // Softmax over gate scores
+                    float gate_sum = 0;
+                    for (int i = 0; i < ratio; i++) {
+                        gate_scores[i] = expf(gate_scores[i] - gate_max);
+                        gate_sum += gate_scores[i];
+                    }
+                    
+                    // Weighted sum of KV tokens
+                    memset(comp_kv, 0, kvd * sizeof(float));
+                    for (int i = 0; i < ratio; i++) {
+                        float w = gate_scores[i] / gate_sum;
+                        int p = (pos - ratio + i) % win;
+                        float *tok_kv = m->K[layer_id] + p * kvd;
+                        for (int d = 0; d < kvd; d++) comp_kv[d] += w * tok_kv[d];
+                    }
+                    
+                    // Apply compressor norm if available
+                    if (l->idx_comp_norm) {
+                        int norm_dim = kvd < 128 ? kvd : 128; // norm weight is 128-dim
+                        rmsnorm_slice(comp_kv, comp_kv, l->idx_comp_norm, norm_dim, c->eps);
+                    }
+                } else {
+                    // Fallback: simple average
+                    memset(comp_kv, 0, kvd * sizeof(float));
+                    for (int i = 0; i < ratio; i++) {
+                        int p = (pos - i) % win;
+                        for (int d = 0; d < kvd; d++) comp_kv[d] += m->K[layer_id][p * kvd + d] / ratio;
+                    }
                 }
+                
                 memcpy(m->K[layer_id] + (win + block_idx) * kvd, comp_kv, kvd * sizeof(float));
                 memcpy(m->V[layer_id] + (win + block_idx) * kvd, comp_kv, kvd * sizeof(float));
             }
         }
         
-        // True Lightning Indexer logic for CSA
+        // Full Multi-Head Lightning Indexer for CSA (compress_ratio=4)
         if (ratio == 4) {
             int max_blocks = pos / ratio;
             if (max_blocks > 4096) max_blocks = 4096;
@@ -415,44 +483,67 @@ static void attention_decode(Model *m, Layer *l, int layer_id, const float *x, i
             if (topk > max_blocks) topk = max_blocks;
             
             if (topk > 0 && l->idx_wq_b.fmt > 0) {
-                // Compute true query index from latent space
-                float *q_idx = falloc(8192); // c->index_n_heads * c->index_head_dim
+                int ih = c->index_n_heads;    // 64
+                int idim = c->index_head_dim; // 128
+                int idx_total = ih * idim;    // 8192
+                
+                // Project q_latent into indexer query space: [1024] -> [8192]
+                float *q_idx = falloc(idx_total);
                 matmul_qt(q_idx, q_latent, &l->idx_wq_b, 1);
+                
+                // Compute per-head weight projections if available
+                float *head_weights = NULL;
+                if (l->idx_wproj.fmt > 0) {
+                    head_weights = falloc(ih);
+                    // idx_wproj projects from hidden to ih scores
+                    // For decode, use q_latent as proxy input
+                    matmul_qt(head_weights, q_latent, &l->idx_wproj, 1);
+                }
                 
                 selected_blocks = (int*)falloc(topk);
                 float *block_scores = falloc(max_blocks);
                 
-                // Score all available blocks in the cache
-                for(int b=0; b<max_blocks; b++) {
+                // Score all compressed blocks using multi-head dot product
+                for (int b = 0; b < max_blocks; b++) {
                     float *comp_kv = m->K[layer_id] + (win + b) * kvd;
+                    float total_score = 0;
                     
-                    // Simple projection of the block's compressed KV to get block score
-                    // Using idx_wproj to simulate the block key
-                    float *k_idx = falloc(8192);
-                    matmul_qt(k_idx, comp_kv, &l->idx_wproj, 1);
+                    for (int h = 0; h < ih; h++) {
+                        float *qh = q_idx + h * idim;
+                        // Use first `idim` dims of compressed KV as block key
+                        int kv_off = (h * idim) % kvd;
+                        float dot = 0;
+                        for (int d = 0; d < idim && (kv_off + d) < kvd; d++) {
+                            dot += qh[d] * comp_kv[kv_off + d];
+                        }
+                        // ReLU activation per head
+                        float relu_dot = dot > 0 ? dot : 0;
+                        // Weight by per-head importance
+                        float hw = (head_weights && h < ih) ? head_weights[h] : 1.0f;
+                        total_score += relu_dot * hw;
+                    }
                     
-                    float score = 0;
-                    for(int i=0; i<64; i++) score += q_idx[i] * k_idx[i];
-                    block_scores[b] = score;
+                    float scale_factor = 1.0f / sqrtf((float)idim * ih);
+                    block_scores[b] = total_score * scale_factor;
                 }
                 
-                // O(N*K) Top-K selection based on the true neural network scores
-                for(int k=0; k<topk; k++) {
+                // Top-K selection
+                for (int k = 0; k < topk; k++) {
                     float best_s = -1e9f; int best_b = -1;
-                    for(int b=0; b<max_blocks; b++) {
+                    for (int b = 0; b < max_blocks; b++) {
                         if (block_scores[b] > best_s) {
                             int used = 0;
-                            for(int j=0; j<k; j++) if(selected_blocks[j] == b) { used = 1; break; }
-                            if(!used) { best_s = block_scores[b]; best_b = b; }
+                            for (int j = 0; j < k; j++) if (selected_blocks[j] == b) { used = 1; break; }
+                            if (!used) { best_s = block_scores[b]; best_b = b; }
                         }
                     }
                     selected_blocks[k] = best_b != -1 ? best_b : (max_blocks - 1 - k);
                 }
                 num_blocks = topk;
             } else if (topk > 0) {
-                // Fallback if weights are missing
+                // Fallback: most recent blocks
                 selected_blocks = (int*)falloc(topk);
-                for(int b=0; b<topk; b++) selected_blocks[b] = max_blocks - 1 - b;
+                for (int b = 0; b < topk; b++) selected_blocks[b] = max_blocks - 1 - b;
                 num_blocks = topk;
             }
         } else {
@@ -560,9 +651,10 @@ static void attention_decode(Model *m, Layer *l, int layer_id, const float *x, i
         } else if (wa->fmt == 1 && wa->q8) {
             for (int r = g * o_lr; r < (g + 1) * o_lr; r++) {
                 float acc = 0;
-                int8_t *row = wa->q8 + (int64_t)r * wa->I + g * group_in;
+                int8_t *row = wa->q8 + (int64_t)r * wa->I;
+                float s = wa->s[r];
                 for (int i = 0; i < group_in; i++)
-                    acc += (float)row[i] * wa->s[r] * in_g[i];
+                    acc += (float)row[i] * s * in_g[i];
                 out_g[r - g * o_lr] = acc;
             }
         }
@@ -592,7 +684,7 @@ static void ffn_silu(float *out, const float *x, QT *w1, QT *w3, QT *w2, int dim
 }
 
 /* ---------- Forward Pass ---------- */
-static void forward_dsv4(Model *m, int token_id, int pos, float *logits) {
+static void forward_dsv4(Model *m, int token_id, int pos, float *logits, float *out_hidden) {
     // printf("DEBUG: forward_dsv4 start token=%d pos=%d\n", token_id, pos); fflush(stdout);
     arena_reset();
     Cfg *c = &m->c;
@@ -699,8 +791,12 @@ static void forward_dsv4(Model *m, int token_id, int pos, float *logits) {
     float *hc_comb_buf = falloc(hc * hc);
     hc_pre(x_single, x_multi, &m->hc_head_fn, m->hc_head_scale, m->hc_head_base,
            hc, dim, c->hc_sinkhorn_iters, c->eps, hc_post_buf, hc_comb_buf);
-    // End of Final HeadRMSNorm
     rmsnorm_slice(x_single, x_single, m->final_norm, dim, c->eps);
+    
+    // Copy the final hidden state if requested (used for MTP drafting)
+    if (out_hidden) {
+        memcpy(out_hidden, x_single, dim * sizeof(float));
+    }
     
     // LM Head: x_single[4096] → logits[vocab_size]
     matmul_qt(logits, x_single, &m->lm_head, 1);
@@ -708,7 +804,93 @@ static void forward_dsv4(Model *m, int token_id, int pos, float *logits) {
 
 }
 
-/* ---------- config loader ---------- */
+/* ---------- MTP Draft Forward ---------- */
+// Runs the MTP module to predict the NEXT token after the main model's prediction.
+// Takes: the main model's final hidden state, the token the main model just predicted.
+// Returns: draft logits for the speculative next-next token.
+static void mtp_draft(Model *m, int draft_token, float *main_hidden, int pos, float *draft_logits) {
+    Cfg *c = &m->c;
+    int dim = c->hidden;
+    int hc = c->hc_mult;
+    MTP *mtp = &m->mtp[0];
+    
+    // 1. Embed the draft token using MTP's own embedding
+    float *tok_emb = falloc(dim);
+    QT *emb_t = &mtp->emb;
+    if (emb_t->fmt == 2) {
+        uint8_t *q4 = emb_t->q4 + (int64_t)draft_token * (dim / 2);
+        float scale = emb_t->s[draft_token];
+        for (int i = 0; i < dim; i += 2) {
+            uint8_t b = q4[i / 2];
+            tok_emb[i]     = ((b & 0xF) - 8) * scale;
+            tok_emb[i + 1] = ((b >> 4) - 8) * scale;
+        }
+    } else if (emb_t->fmt == 1) {
+        int8_t *q8 = emb_t->q8 + (int64_t)draft_token * dim;
+        float scale = emb_t->s[draft_token];
+        for (int i = 0; i < dim; i++) tok_emb[i] = (float)q8[i] * scale;
+    } else if (emb_t->qf) {
+        memcpy(tok_emb, emb_t->qf + (int64_t)draft_token * dim, dim * sizeof(float));
+    }
+    
+    // 2. Normalize embedding and main hidden state
+    float *norm_emb = falloc(dim);
+    float *norm_hidden = falloc(dim);
+    rmsnorm_slice(norm_emb, tok_emb, mtp->enorm, dim, c->eps);
+    rmsnorm_slice(norm_hidden, main_hidden, mtp->hnorm, dim, c->eps);
+    
+    // 3. Project main hidden through e_proj and combine with token embedding
+    float *proj = falloc(dim);
+    matmul_qt(proj, norm_hidden, &mtp->e_proj, 1);
+    
+    float *x_combined = falloc(dim);
+    for (int i = 0; i < dim; i++) x_combined[i] = proj[i] + norm_emb[i];
+    
+    // 4. Expand into hc streams
+    int hc_dim = hc * dim;
+    float *x_multi = falloc(hc_dim);
+    for (int j = 0; j < hc; j++) memcpy(x_multi + j * dim, x_combined, dim * sizeof(float));
+    
+    // 5. Run MTP transformer layer (shared expert only for draft speed)
+    Layer *l = &mtp->layer;
+    float *x_single = falloc(dim);
+    float *residual = falloc(hc_dim);
+    float *post_buf = falloc(hc);
+    float *comb_buf = falloc(hc * hc);
+    
+    // Attention block
+    memcpy(residual, x_multi, hc_dim * sizeof(float));
+    hc_pre(x_single, x_multi, &l->hc_attn_fn, l->hc_attn_scale, l->hc_attn_base,
+           hc, dim, c->hc_sinkhorn_iters, c->eps, post_buf, comb_buf);
+    rmsnorm_slice(x_single, x_single, l->attn_norm, dim, c->eps);
+    
+    float *attn_out = falloc(dim);
+    attention_decode(m, l, c->n_layers - 1, x_single, pos, attn_out);
+    hc_post(x_multi, attn_out, residual, post_buf, comb_buf, hc, dim);
+    
+    // FFN block (shared expert only for speed)
+    memcpy(residual, x_multi, hc_dim * sizeof(float));
+    hc_pre(x_single, x_multi, &l->hc_ffn_fn, l->hc_ffn_scale, l->hc_ffn_base,
+           hc, dim, c->hc_sinkhorn_iters, c->eps, post_buf, comb_buf);
+    rmsnorm_slice(x_single, x_single, l->ffn_norm, dim, c->eps);
+    
+    float *ffn_out = falloc(dim);
+    memset(ffn_out, 0, dim * sizeof(float));
+    if (l->shared_w1.fmt != 0 || l->shared_w1.qf) {
+        float *sh_out = falloc(dim);
+        ffn_silu(sh_out, x_single, &l->shared_w1, &l->shared_w3, &l->shared_w2, dim, c->moe_inter);
+        for (int d = 0; d < dim; d++) ffn_out[d] += sh_out[d];
+    }
+    hc_post(x_multi, ffn_out, residual, post_buf, comb_buf, hc, dim);
+    
+    // 6. Head
+    hc_pre(x_single, x_multi, &mtp->hc_head_fn, mtp->hc_head_scale, mtp->hc_head_base,
+           hc, dim, c->hc_sinkhorn_iters, c->eps, post_buf, comb_buf);
+    rmsnorm_slice(x_single, x_single, m->final_norm, dim, c->eps);
+    matmul_qt(draft_logits, x_single, &mtp->head, 1);
+}
+
+
 static void load_cfg(Cfg *c, const char *snap) {
     char path[2048]; snprintf(path, sizeof(path), "%s/config.json", snap);
     FILE *f = fopen(path, "rb"); if(!f){perror(path);exit(1);}
@@ -818,31 +1000,91 @@ int main(int argc, char **argv) {
         
         int pos = 0;
         float *logits = malloc(m->c.vocab_size * sizeof(float));
+        float *draft_logits = malloc(m->c.vocab_size * sizeof(float));
+        float *main_hidden = malloc(m->c.hidden * sizeof(float));
         
         // Prefill
-        for(int i=0; i<n_tokens; i++) {
-            forward_dsv4(m, input_ids[i], pos++, logits);
+        for(int i = 0; i < n_tokens; i++) {
+            forward_dsv4(m, input_ids[i], pos++, logits, main_hidden);
         }
         
-        // Decode
+        // Speculative Decode State
+        int current_token = 0;
+        float max_l = logits[0];
+        for (int i = 1; i < m->c.vocab_size; i++) {
+            if (logits[i] > max_l) {
+                max_l = logits[i];
+                current_token = i;
+            }
+        }
+        
+        char buf[128];
+        tok_decode(&m->tokenizer, &current_token, 1, buf, 128);
+        printf("%s", buf);
+        fflush(stdout);
+        
+        int draft_token = -1; // -1 means no valid draft
+        
+        // Decode Loop
         for (int step = 0; step < 256; step++) {
-            int next = 0;
-            float max_l = logits[0];
-            for (int i=1; i<m->c.vocab_size; i++) {
+            // If we don't have a draft, we generate one from the last main_hidden
+            if (draft_token == -1 && current_token != 1) {
+                mtp_draft(m, current_token, main_hidden, pos, draft_logits);
+                max_l = draft_logits[0];
+                int next_draft = 0;
+                for (int i = 1; i < m->c.vocab_size; i++) {
+                    if (draft_logits[i] > max_l) {
+                        max_l = draft_logits[i];
+                        next_draft = i;
+                    }
+                }
+                draft_token = next_draft;
+            }
+            
+            // At this point we have `current_token` that we trust, and `draft_token` that we generated.
+            // We need to run the main model on `current_token` to predict what the true NEXT token is,
+            // and see if it matches `draft_token`.
+            
+            // Run main model on current_token
+            forward_dsv4(m, current_token, pos++, logits, main_hidden);
+            
+            // Get the true next token
+            int true_next = 0;
+            max_l = logits[0];
+            for (int i = 1; i < m->c.vocab_size; i++) {
                 if (logits[i] > max_l) {
                     max_l = logits[i];
-                    next = i;
+                    true_next = i;
                 }
             }
             
-            if (next == 1) break; // EOS token
+            // Print the true next token
+            if (true_next == 1) break; // EOS
+            tok_decode(&m->tokenizer, &true_next, 1, buf, 128);
             
-            char buf[128];
-            tok_decode(&m->tokenizer, &next, 1, buf, 128);
-            printf("%s", buf);
+            if (true_next == draft_token) {
+                // VERIFY ACCEPTED! 
+                // We got 2 tokens for the price of 1!
+                printf("%s", buf);
+                
+                // Now we need to also output the draft token (since it was accepted)
+                // But wait, `true_next` IS the draft token. We just printed it.
+                // We need to set up for the next step.
+                // Because we accepted the draft, we can trust that `draft_token` is valid.
+                // So current_token becomes draft_token.
+                current_token = true_next;
+                draft_token = -1; // We consumed the draft, need a new one
+            } else {
+                // VERIFY REJECTED
+                // The main model disagreed. The true token is `true_next`, not `draft_token`.
+                // We still output `true_next`.
+                printf("%s", buf);
+                
+                // The draft is invalid. We set current_token to the true_next, and wipe the draft.
+                current_token = true_next;
+                draft_token = -1;
+            }
             fflush(stdout);
-            
-            forward_dsv4(m, next, pos++, logits);
         }
         printf("\n");
     }

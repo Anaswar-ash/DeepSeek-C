@@ -151,4 +151,50 @@ static void wire_tensors(Model *m) {
         qt_load(S, &l->idx_wproj, snprintf(buf, sizeof(buf), "layers.%d.attn.indexer.weights_proj.weight", i) ? buf : buf, 0, 0);
         qt_load(S, &l->idx_wq_b, snprintf(buf, sizeof(buf), "layers.%d.attn.indexer.wq_b.weight", i) ? buf : buf, 0, 0);
     }
+    
+    // MTP (Multi-Token Prediction) wiring
+    m->n_mtp = 1; // num_nextn_predict_layers
+    m->mtp = calloc(m->n_mtp, sizeof(MTP));
+    
+    for (int mi = 0; mi < m->n_mtp; mi++) {
+        MTP *mtp = &m->mtp[mi];
+        printf("  [wire] MTP module %d\n", mi);
+        
+        qt_load(S, &mtp->emb, snprintf(buf, sizeof(buf), "mtp.%d.emb.tok_emb.weight", mi) ? buf : buf, c->vocab_size, c->hidden);
+        qt_load(S, &mtp->e_proj, snprintf(buf, sizeof(buf), "mtp.%d.e_proj.weight", mi) ? buf : buf, c->hidden, c->hidden);
+        mtp->enorm = fp32_load(S, snprintf(buf, sizeof(buf), "mtp.%d.enorm.weight", mi) ? buf : buf);
+        mtp->hnorm = fp32_load(S, snprintf(buf, sizeof(buf), "mtp.%d.hnorm.weight", mi) ? buf : buf);
+        qt_load(S, &mtp->head, snprintf(buf, sizeof(buf), "mtp.%d.head.weight", mi) ? buf : buf, c->vocab_size, c->hidden);
+        
+        qt_load(S, &mtp->hc_head_fn, snprintf(buf, sizeof(buf), "mtp.%d.hc_head_fn", mi) ? buf : buf, 0, 0);
+        mtp->hc_head_base = fp32_load(S, snprintf(buf, sizeof(buf), "mtp.%d.hc_head_base", mi) ? buf : buf);
+        mtp->hc_head_scale = fp32_load(S, snprintf(buf, sizeof(buf), "mtp.%d.hc_head_scale", mi) ? buf : buf);
+        
+        // Wire the MTP transformer layer (same structure as a main layer)
+        Layer *l = &mtp->layer;
+        l->ffn_norm = fp32_load(S, snprintf(buf, sizeof(buf), "mtp.%d.ffn_norm.weight", mi) ? buf : buf);
+        qt_load(S, &l->shared_w1, snprintf(buf, sizeof(buf), "mtp.%d.ffn.shared_experts.w1.weight", mi) ? buf : buf, 0, dim);
+        qt_load(S, &l->shared_w2, snprintf(buf, sizeof(buf), "mtp.%d.ffn.shared_experts.w2.weight", mi) ? buf : buf, dim, 0);
+        qt_load(S, &l->shared_w3, snprintf(buf, sizeof(buf), "mtp.%d.ffn.shared_experts.w3.weight", mi) ? buf : buf, 0, dim);
+        qt_load(S, &l->gate, snprintf(buf, sizeof(buf), "mtp.%d.ffn.gate.weight", mi) ? buf : buf, m->c.n_experts, dim);
+        l->gate_bias = fp32_load(S, snprintf(buf, sizeof(buf), "mtp.%d.ffn.gate.bias", mi) ? buf : buf);
+        
+        l->attn_norm = fp32_load(S, snprintf(buf, sizeof(buf), "mtp.%d.attn_norm.weight", mi) ? buf : buf);
+        qt_load(S, &l->wq_a, snprintf(buf, sizeof(buf), "mtp.%d.attn.wq_a.weight", mi) ? buf : buf, m->c.q_lora_rank, dim);
+        qt_load(S, &l->wq_b, snprintf(buf, sizeof(buf), "mtp.%d.attn.wq_b.weight", mi) ? buf : buf, 0, m->c.q_lora_rank);
+        l->q_norm = fp32_load(S, snprintf(buf, sizeof(buf), "mtp.%d.attn.q_norm.weight", mi) ? buf : buf);
+        qt_load(S, &l->wkv, snprintf(buf, sizeof(buf), "mtp.%d.attn.wkv.weight", mi) ? buf : buf, 0, dim);
+        l->kv_norm = fp32_load(S, snprintf(buf, sizeof(buf), "mtp.%d.attn.kv_norm.weight", mi) ? buf : buf);
+        qt_load(S, &l->wo_a, snprintf(buf, sizeof(buf), "mtp.%d.attn.wo_a.weight", mi) ? buf : buf, 0, (m->c.n_heads * m->c.head_dim) / m->c.o_groups);
+        qt_load(S, &l->wo_b, snprintf(buf, sizeof(buf), "mtp.%d.attn.wo_b.weight", mi) ? buf : buf, dim, 0);
+        l->attn_sink = fp32_load(S, snprintf(buf, sizeof(buf), "mtp.%d.attn.attn_sink", mi) ? buf : buf);
+        
+        // MTP layer hc weights
+        l->hc_attn_base = fp32_load(S, snprintf(buf, sizeof(buf), "mtp.%d.hc_attn_base", mi) ? buf : buf);
+        l->hc_attn_scale = fp32_load(S, snprintf(buf, sizeof(buf), "mtp.%d.hc_attn_scale", mi) ? buf : buf);
+        qt_load(S, &l->hc_attn_fn, snprintf(buf, sizeof(buf), "mtp.%d.hc_attn_fn", mi) ? buf : buf, (2 + m->c.hc_mult) * m->c.hc_mult, m->c.hc_mult * dim);
+        l->hc_ffn_base = fp32_load(S, snprintf(buf, sizeof(buf), "mtp.%d.hc_ffn_base", mi) ? buf : buf);
+        l->hc_ffn_scale = fp32_load(S, snprintf(buf, sizeof(buf), "mtp.%d.hc_ffn_scale", mi) ? buf : buf);
+        qt_load(S, &l->hc_ffn_fn, snprintf(buf, sizeof(buf), "mtp.%d.hc_ffn_fn", mi) ? buf : buf, (2 + m->c.hc_mult) * m->c.hc_mult, m->c.hc_mult * dim);
+    }
 }
