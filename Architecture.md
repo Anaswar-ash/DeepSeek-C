@@ -46,6 +46,12 @@ The C engine utilizes **OpenMP** to split the matrix multiplication math across 
 ### Lightning Indexer
 For CSA layers (compress_ratio=4), the engine uses the downloaded indexer weights (`idx_wq_b`, `idx_wproj`) to perform a lightweight neural-network query that scores all compressed KV blocks and selects the top-512 most relevant ones. This replaces the earlier mock fallback that just picked the most recent blocks sequentially.
 
+### Multi-Token Prediction (MTP)
+To double generation speed, DeepSeek-C uses MTP Speculative Decoding. The engine runs a lightweight MTP block (a single transformer layer + projection head) to rapidly draft a future token. On the next step, the main model verifies this draft. If correct, the draft is accepted "for free," skipping a 43-layer forward pass.
+
+### Advanced Generation
+The engine supports **Top-P (0.9) and Temperature (0.7)** sampling for diverse output, moving beyond deterministic Greedy decoding. It also implements **YaRN RoPE Scaling** for coherent text generation at extended context lengths.
+
 ---
 
 ## 3. Flowchart: The Generation Loop
@@ -91,10 +97,15 @@ graph TD
     Y -->|No| Z["hc_head (Sinkhorn → shrink to 1 stream)"]
     Z --> AA["Final RMSNorm"]
     AA --> AB["LM Head (INT4 matmul → 129,280 logits)"]
-    AB --> AC["Greedy Argmax → Next Token"]
-    AC --> AD{{"EOS?"}}
-    AD -->|No| E
-    AD -->|Yes| AE["Final Text Output"]
+    AB --> AC["Top-P / Temperature Sampling → True Next Token"]
+    AC --> AD{"True Token == MTP Draft?"}
+    AD -->|Yes| AE["Accept Draft Token! (2x speed)"]
+    AD -->|No| AF["Reject Draft. Use True Token."]
+    AE --> AG{"EOS?"}
+    AF --> AG
+    AG -->|No| AH["MTP Draft Head predicts next draft token"]
+    AH --> E
+    AG -->|Yes| AI["Final Text Output"]
 ```
 
 ---
