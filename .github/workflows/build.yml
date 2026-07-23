@@ -28,7 +28,7 @@ jobs:
 
     - name: Compile Windows Executable
       run: |
-        gcc -D_FILE_OFFSET_BITS=64 -O3 -march=x86-64-v3 -fopenmp -Wall -Wextra -Wno-unused-parameter -Wno-misleading-indentation -Wno-unused-function dsv4.c -o dsv4.exe -lm -static
+        gcc -D_FILE_OFFSET_BITS=64 -O3 -march=x86-64-v3 -fopenmp -Wall -Wextra -Wno-unused-parameter -Wno-misleading-indentation -Wno-unused-function server.c mongoose.c -o dsv4.exe -lm -lws2_32 -static
 
     - name: Upload Executable
       uses: actions/upload-artifact@v4

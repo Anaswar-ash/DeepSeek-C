@@ -44,7 +44,7 @@ else ifneq ($(IS_WIN),)
 CC      = gcc
 ARCH   ?= x86-64-v3
 CFLAGS  = -D_FILE_OFFSET_BITS=64 -O3 -march=$(ARCH) -fopenmp -Wall -Wextra -Wno-unused-parameter -Wno-misleading-indentation -Wno-unused-function
-LDFLAGS = -lm -fopenmp -static
+LDFLAGS = -lm -fopenmp -static -lws2_32
 EXE     = .exe
 else
 UNAME_M := $(shell uname -m)
@@ -177,8 +177,8 @@ cuda-bench: backend_cuda.cu backend_cuda.h tests/bench_tensor_core.cu
 olmoe$(EXE): olmoe.c st.h json.h compat.h
 	$(CC) $(CFLAGS) olmoe.c -o olmoe$(EXE) $(LDFLAGS)
 
-dsv4$(EXE): dsv4.c st.h json.h compat.h
-	$(CC) $(CFLAGS) dsv4.c -o dsv4$(EXE) $(LDFLAGS)
+dsv4$(EXE): server.c mongoose.c dsv4.c st.h json.h compat.h
+	$(CC) $(CFLAGS) server.c mongoose.c -o dsv4$(EXE) $(LDFLAGS)
 
 # binario portabile da distribuire su altre macchine x86-64
 portable:
