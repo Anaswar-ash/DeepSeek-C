@@ -63,10 +63,12 @@ static char *j_parse_str_raw(jparser *p) {
                 case 'f': c = '\f'; break; case '/': c = '/'; break;
                 case '\\': c = '\\'; break; case '"': c = '"'; break;
                 case 'u': {  /* \uXXXX -> codepoint UTF-8 (con coppie surrogate) */
-                    unsigned cp = (unsigned)strtoul((char[]){p->s[0],p->s[1],p->s[2],p->s[3],0}, NULL, 16);
+                    char hex[5] = {p->s[0],p->s[1],p->s[2],p->s[3],0};
+                    unsigned cp = (unsigned)strtoul(hex, NULL, 16);
                     p->s += 4;
                     if (cp >= 0xD800 && cp <= 0xDBFF && p->s[0]=='\\' && p->s[1]=='u') {
-                        unsigned lo = (unsigned)strtoul((char[]){p->s[2],p->s[3],p->s[4],p->s[5],0}, NULL, 16);
+                        char hex2[5] = {p->s[2],p->s[3],p->s[4],p->s[5],0};
+                        unsigned lo = (unsigned)strtoul(hex2, NULL, 16);
                         if (lo >= 0xDC00 && lo <= 0xDFFF) { cp = 0x10000 + ((cp-0xD800)<<10) + (lo-0xDC00); p->s += 6; }
                     }
                     if (cp < 0x80) { J_PUT(cp); }
@@ -144,6 +146,24 @@ static jval *json_get(jval *o, const char *key) {
     if (!o || o->t != J_OBJ) return NULL;
     for (int i = 0; i < o->len; i++) if (strcmp(o->keys[i], key) == 0) return o->kids[i];
     return NULL;
+}
+
+static void json_free(jval *v) {
+    if (!v) return;
+    if (v->t == J_STR) free(v->str);
+    if (v->t == J_OBJ) {
+        for (int i = 0; i < v->len; i++) {
+            free(v->keys[i]);
+            json_free(v->kids[i]);
+        }
+        free(v->keys);
+        free(v->kids);
+    }
+    if (v->t == J_ARR) {
+        for (int i = 0; i < v->len; i++) json_free(v->kids[i]);
+        free(v->kids);
+    }
+    free(v);
 }
 
 #endif

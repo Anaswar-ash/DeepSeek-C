@@ -12,8 +12,10 @@
 #include <string.h>
 #include <stdint.h>
 #include <fcntl.h>
+#ifndef _WIN32
 #include <unistd.h>
 #include <dirent.h>
+#endif
 #include "json.h"
 #include "compat.h"
 
@@ -103,6 +105,18 @@ static void st_init(shards *S, const char *snap_dir) {
     S->cap = 4096; S->t = calloc(S->cap, sizeof(st_tensor));
     /* raccoglie ordinatamente i nomi dei file shard */
     static char files[ST_MAX_SHARDS][1024]; int nf = 0;
+#ifdef _WIN32
+    WIN32_FIND_DATAA ffd;
+    char search_path[1024];
+    snprintf(search_path, 1024, "%s\\*.safetensors", snap_dir);
+    HANDLE hFind = FindFirstFileA(search_path, &ffd);
+    if (hFind == INVALID_HANDLE_VALUE) { perror(snap_dir); exit(1); }
+    do {
+        if (nf >= ST_MAX_SHARDS) { fprintf(stderr, "too many shards (>%d): raise ST_MAX_SHARDS\n", ST_MAX_SHARDS); exit(1); }
+        snprintf(files[nf++], 1024, "%s/%s", snap_dir, ffd.cFileName);
+    } while (FindNextFileA(hFind, &ffd) != 0);
+    FindClose(hFind);
+#else
     DIR *d = opendir(snap_dir); struct dirent *e;
     if (!d) { perror(snap_dir); exit(1); }
     while ((e = readdir(d))) {
@@ -113,6 +127,7 @@ static void st_init(shards *S, const char *snap_dir) {
         }
     }
     closedir(d);
+#endif
     for (int a = 0; a < nf; a++) for (int b = a+1; b < nf; b++)
         if (strcmp(files[a], files[b]) > 0) { char tmp[1024]; strcpy(tmp, files[a]); strcpy(files[a], files[b]); strcpy(files[b], tmp); }
 
@@ -140,7 +155,8 @@ static void st_init(shards *S, const char *snap_dir) {
             t->name = strdup(name); t->fd = fd; t->off = data_start + a0;
             t->nbytes = b0 - a0; t->dtype = st_dtype_code(dt->str); t->numel = numel;
         }
-        free(arena); /* i jval restano leakati: ok, una tantum all'avvio */
+        json_free(root);
+        free(arena);
         free(hdr);
     }
     /* indice hash costruito a fine indicizzazione (gli indici restano validi dopo i realloc) */
@@ -189,6 +205,9 @@ static int64_t st_read_f32(shards *S, const char *name, float *out, int drop) {
         memcpy(out, raw, t->nbytes);
     } else if (t->dtype == 0) {
         uint16_t *p = (uint16_t *)raw; for (int64_t i = 0; i < t->numel; i++) out[i] = bf16_to_f32(p[i]);
+    } else if (t->dtype == 3) {
+        /* U8 / I8: cast each byte to float32 (used for quantized scale tensors) */
+        uint8_t *p = (uint8_t *)raw; for (int64_t i = 0; i < t->numel; i++) out[i] = (float)p[i];
     } else {
         uint16_t *p = (uint16_t *)raw; for (int64_t i = 0; i < t->numel; i++) out[i] = f16_to_f32(p[i]);
     }

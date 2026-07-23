@@ -3,9 +3,8 @@
 #include <stdlib.h>
 #include <string.h>
 
-#ifndef _WIN32
-#include <sys/mman.h>
-#endif
+
+
 
 static void *qalloc(size_t n){
     void *p = NULL;
@@ -18,8 +17,12 @@ static void *qalloc(size_t n){
     return p;
 }
 
+#ifdef _WIN32
 #include <windows.h>
 #include <io.h>
+#else
+#include <sys/mman.h>
+#endif
 
 static void *get_mmap_base(int fd) {
     static int mapped_fds[512];
@@ -28,10 +31,19 @@ static void *get_mmap_base(int fd) {
     for (int i = 0; i < num_mapped; i++) {
         if (mapped_fds[i] == fd) return mapped_bases[i];
     }
+    void *base = NULL;
+#ifdef _WIN32
     HANDLE hFile = (HANDLE)_get_osfhandle(fd);
     HANDLE hMap = CreateFileMapping(hFile, NULL, PAGE_READONLY, 0, 0, NULL);
-    void *base = MapViewOfFile(hMap, FILE_MAP_READ, 0, 0, 0);
+    if (!hMap) { fprintf(stderr, "CreateFileMapping failed for fd %d\n", fd); exit(1); }
+    base = MapViewOfFile(hMap, FILE_MAP_READ, 0, 0, 0);
+    CloseHandle(hMap);
     if (!base) { fprintf(stderr, "mmap failed for fd %d\n", fd); exit(1); }
+#else
+    off_t size = lseek(fd, 0, SEEK_END);
+    base = mmap(NULL, size, PROT_READ, MAP_PRIVATE, fd, 0);
+    if (base == MAP_FAILED) { fprintf(stderr, "mmap failed for fd %d\n", fd); exit(1); }
+#endif
     mapped_fds[num_mapped] = fd;
     mapped_bases[num_mapped] = base;
     num_mapped++;
@@ -134,6 +146,7 @@ static void wire_tensors(Model *m) {
         
         qt_load(S, &l->wo_a, snprintf(buf, sizeof(buf), "layers.%d.attn.wo_a.weight", i) ? buf : buf, 0, (m->c.n_heads * m->c.head_dim) / m->c.o_groups);
         qt_load(S, &l->wo_b, snprintf(buf, sizeof(buf), "layers.%d.attn.wo_b.weight", i) ? buf : buf, dim, 0);
+        l->attn_sink = fp32_load(S, snprintf(buf, sizeof(buf), "layers.%d.attn.attn_sink", i) ? buf : buf);
         
         l->hc_attn_base = fp32_load(S, snprintf(buf, sizeof(buf), "layers.%d.hc_attn_base", i) ? buf : buf);
         l->hc_attn_scale = fp32_load(S, snprintf(buf, sizeof(buf), "layers.%d.hc_attn_scale", i) ? buf : buf);

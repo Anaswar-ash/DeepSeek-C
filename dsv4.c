@@ -133,7 +133,17 @@ typedef struct {
 /* ---------- utility ---------- */
 static inline float sigmoidf(float x) { return 1.0f / (1.0f + expf(-x)); }
 
+#ifdef _WIN32
+static double now_s(void) {
+    LARGE_INTEGER freq;
+    LARGE_INTEGER t;
+    QueryPerformanceFrequency(&freq);
+    QueryPerformanceCounter(&t);
+    return (double)t.QuadPart / (double)freq.QuadPart;
+}
+#else
 static double now_s(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec + t.tv_nsec*1e-9; }
+#endif
 static double rss_gb(void) { return 0.0; } // getrusage not on Windows by default
 // Arena Allocator
 #define ARENA_SIZE (256 * 1024 * 1024)
@@ -156,7 +166,11 @@ static float *falloc(int64_t n) {
     if (!g_arena) arena_init();
     size_t bytes = n * sizeof(float);
     bytes = (bytes + 31) & ~31; // Align 32 bytes for AVX2
+#ifdef _MSC_VER
+    size_t old_offset = (size_t)InterlockedExchangeAdd64((volatile LONG64 *)&g_arena_offset, (LONG64)bytes);
+#else
     size_t old_offset = __atomic_fetch_add(&g_arena_offset, bytes, __ATOMIC_SEQ_CST);
+#endif
     if (old_offset + bytes > ARENA_SIZE) {
         fprintf(stderr, "Arena OOM %ld\n", (long)n); exit(1);
     }
@@ -308,16 +322,37 @@ static void rope_head(float *x, int pos, const Cfg *c) {
     int offset = c->head_dim - c->qk_rope_head_dim; // RoPE applies to last `rd` dims
     float *xr = x + offset;
     
-    // YaRN RoPE scaling for extended context lengths
-    float yarn_scale = 1.0f;
-    if (pos > 4096) {
-        float factor = (float)pos / 4096.0f;
-        yarn_scale = factor * factor; // Simplified YaRN theta scaling
+    // DeepSeek YaRN parameters
+    float factor = 40.0f;
+    float original_max_pos = 4096.0f;
+    float beta_fast = 32.0f;
+    float beta_slow = 1.0f;
+    float mscale = 1.0f;
+    float ext_factor = 1.0f;
+    
+    if (pos > original_max_pos) {
+        ext_factor = factor;
+        mscale = 0.1f * logf(factor) + 1.0f;
     }
     
     for (int j = 0; j < h; j++) {
-        float inv = powf(c->theta * yarn_scale, -2.0f * j / c->qk_rope_head_dim);
-        float ang = pos * inv, cs = cosf(ang), sn = sinf(ang);
+        float freq = 1.0f / powf(c->theta, 2.0f * j / c->qk_rope_head_dim);
+        
+        if (pos > original_max_pos) {
+            float wavelength = 2.0f * 3.14159265f / freq;
+            if (wavelength > beta_fast * original_max_pos) {
+                freq /= ext_factor;
+            } else if (wavelength > beta_slow * original_max_pos) {
+                float inv_freq_ext = freq / ext_factor;
+                float w = (original_max_pos / wavelength - 1.0f / beta_fast) / (1.0f / beta_slow - 1.0f / beta_fast);
+                freq = w * freq + (1.0f - w) * inv_freq_ext;
+            }
+        }
+        
+        float ang = pos * freq;
+        float cs = cosf(ang) * mscale;
+        float sn = sinf(ang) * mscale;
+        
         float a = xr[j], b = xr[j+h];
         xr[j]   = a*cs - b*sn;
         xr[j+h] = b*cs + a*sn;
@@ -745,7 +780,7 @@ static void forward_dsv4(Model *m, int token_id, int pos, float *logits, float *
         
         // Attention mechanism dispatch
         float *attn_out = falloc(dim);
-        int ratio = c->compress_ratios[l_id];
+        int ratio = c->compress_ratios ? c->compress_ratios[l_id] : 0;
         // All ratio types (SWA/CSA/HCA) are dispatched inside attention_decode
         attention_decode(m, l, l_id, x_single, pos, attn_out);
         
@@ -817,6 +852,7 @@ static void forward_dsv4(Model *m, int token_id, int pos, float *logits, float *
 // Takes: the main model's final hidden state, the token the main model just predicted.
 // Returns: draft logits for the speculative next-next token.
 static void mtp_draft(Model *m, int draft_token, float *main_hidden, int pos, float *draft_logits) {
+    arena_reset();
     Cfg *c = &m->c;
     int dim = c->hidden;
     int hc = c->hc_mult;
@@ -873,7 +909,7 @@ static void mtp_draft(Model *m, int draft_token, float *main_hidden, int pos, fl
     rmsnorm_slice(x_single, x_single, l->attn_norm, dim, c->eps);
     
     float *attn_out = falloc(dim);
-    attention_decode(m, l, c->n_layers - 1, x_single, pos, attn_out);
+    attention_decode(m, l, c->n_layers, x_single, pos, attn_out); // Use extra KV slot for MTP
     hc_post(x_multi, attn_out, residual, post_buf, comb_buf, hc, dim);
     
     // FFN block (shared expert only for speed)
@@ -940,6 +976,7 @@ static void load_cfg(Cfg *c, const char *snap) {
     printf("  Config: hidden=%d layers=%d heads=%d hd=%d vocab=%d moe_inter=%d experts=%d topk=%d\n",
            c->hidden, c->n_layers, c->n_heads, c->head_dim, c->vocab_size, c->moe_inter, c->n_experts, c->topk);
     
+    json_free(r);
     free(buf); free(arena);
 }
 
@@ -958,9 +995,10 @@ static void model_init(Model *m, const char *snap) {
     tok_load(&m->tokenizer, tok_path);
     
     m->L = calloc(m->c.n_layers, sizeof(Layer));
-    m->K = calloc(m->c.n_layers, sizeof(float*));
-    m->V = calloc(m->c.n_layers, sizeof(float*));
-    for (int i=0; i<m->c.n_layers; i++) {
+    int total_layers = m->c.n_layers + 1; // +1 for MTP KV cache
+    m->K = calloc(total_layers, sizeof(float*));
+    m->V = calloc(total_layers, sizeof(float*));
+    for (int i=0; i<total_layers; i++) {
         int max_compressed_blocks = 4096;
         m->K[i] = calloc((m->c.window_size + max_compressed_blocks) * m->c.kv_lora_rank, sizeof(float));
         m->V[i] = calloc((m->c.window_size + max_compressed_blocks) * m->c.kv_lora_rank, sizeof(float));
@@ -997,7 +1035,8 @@ static int sample_topp(float *logits, int vocab_size, float temperature, float t
     for (int i = 1; i < vocab_size; i++) if (logits[i] > max_l) max_l = logits[i];
     
     float sum = 0.0f;
-    ProbIndex *pi = malloc(vocab_size * sizeof(ProbIndex));
+    static ProbIndex *pi = NULL;
+    if (!pi) pi = malloc(vocab_size * sizeof(ProbIndex));
     for (int i = 0; i < vocab_size; i++) {
         float p = expf((logits[i] - max_l) / temperature);
         pi[i].prob = p;
@@ -1023,11 +1062,10 @@ static int sample_topp(float *logits, int vocab_size, float temperature, float t
         current += pi[i].prob;
         if (r <= current) { selected = pi[i].index; break; }
     }
-    free(pi);
     return selected;
 }
 
-int main(int argc, char **argv) {
+int dsv4_main(int argc, char **argv) {
     setvbuf(stdout, NULL, _IONBF, 0);
     
     if (argc < 2) {
@@ -1078,12 +1116,19 @@ int main(int argc, char **argv) {
         }
         
         int input_ids[2048];
-        int n_tokens = tok_encode(&m->tokenizer, user_input, strlen(user_input), input_ids, 2048);
+        int n_tokens = 0;
+        if (pos == 0) input_ids[n_tokens++] = 0;      // <|begin of sentence|>
+        input_ids[n_tokens++] = 128803; // <|User|>
+        n_tokens += tok_encode(&m->tokenizer, user_input, strlen(user_input), input_ids + n_tokens, 2048 - n_tokens - 1);
+        input_ids[n_tokens++] = 128804; // <|Assistant|>
         printf("[TOKENIZER]: Successfully parsed %d tokens\n[OUTPUT]: ", n_tokens);
         
         // Prefill
         for(int i = 0; i < n_tokens; i++) {
             forward_dsv4(m, input_ids[i], pos++, logits, main_hidden);
+            if (n_tokens > 50 && i % (n_tokens / 10 + 1) == 0) {
+                printf("."); fflush(stdout);
+            }
         }
         
         // Speculative Decode State

@@ -70,8 +70,15 @@ static inline int compat_open_direct(const char *path){
 /* Belt-and-braces: 64-bit off_t mandatory — model is 370 GB, every pread
  * region can exceed 2 GB. 32-bit off_t silently wraps >4 GB offsets into the
  * first 4 GB → reads wrong weight bytes → silent token corruption. */
+#ifdef _MSC_VER
+#undef off_t
+#define off_t int64_t
+#include <BaseTsd.h>
+typedef SSIZE_T ssize_t;
+#else
 #if !defined(_FILE_OFFSET_BITS) || _FILE_OFFSET_BITS < 64
 #error "_FILE_OFFSET_BITS=64 required on Windows (add -D_FILE_OFFSET_BITS=64 to CFLAGS)"
+#endif
 #endif
 
 #ifndef WIN32_LEAN_AND_MEAN
@@ -199,7 +206,9 @@ static inline int getrusage(int who, struct rusage *r){
 }
 
 /* --- getline -> compat_getline (fgets + realloc) --- */
+#ifndef _MSC_VER
 #include <sys/types.h>  /* ssize_t */
+#endif
 static inline ssize_t compat_getline(char **lineptr, size_t *n, FILE *stream){
     if(!lineptr || !n || !stream){ errno = EINVAL; return -1; }
     if(!*lineptr || !*n){ *n = 128; free(*lineptr); *lineptr = malloc(*n); if(!*lineptr) return -1; }
