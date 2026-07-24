@@ -33,10 +33,10 @@ make dsv4
 
 ### 2. Download and Quantize the Model
 Use the provided python tool to download the FP8 weights straight from HuggingFace and compress them into INT4.
-*Note: You need `safetensors` and `huggingface_hub` installed (`pip install safetensors huggingface_hub`).*
+*Note: You need `safetensors` and `huggingface_hub` installed (`pip install safetensors huggingface_hub numpy torch`).*
 
 ```bash
-python tools/convert_fp8_to_int4.py --hf_url deepseek-ai/DeepSeek-V4-Flash --out_dir ./v4_int4
+python tools/convert_dsv4.py --repo deepseek-ai/DeepSeek-V4-Flash --outdir ./v4_int4 --mtp
 ```
 *(This will download roughly 150GB of data. Ensure you have adequate storage space!)*
 
