@@ -363,7 +363,6 @@ static void rope_head(float *x, int pos, const Cfg *c) {
 // Compress 8 tokens (overlap=True) into 1 KV token
 static void compress_kv_overlap(const float *kv_state, const float *score_state, float *out_kv, int ratio, int d) {
     // kv_state is [2 * ratio, 2 * d]. score_state is [2 * ratio, 2 * d].
-    float *sc = falloc(2 * ratio);
     
     // We compute score softmax.
     // The concatenation effectively takes:
@@ -710,7 +709,7 @@ static void attention_decode(Model *m, Layer *l, int layer_id, const float *x, i
 }
 
 /* ---------- SiLU-gated FFN (shared or routed expert) ---------- */
-static void ffn_silu(float *out, const float *x, QT *w1, QT *w3, QT *w2, int dim, int ignored_inter) {
+static void ffn_silu(float *out, const float *x, QT *w1, QT *w3, QT *w2) {
     int inter = w1->O;
     float *gate = falloc(inter);
     float *up   = falloc(inter);
@@ -780,7 +779,6 @@ static void forward_dsv4(Model *m, int token_id, int pos, float *logits, float *
         
         // Attention mechanism dispatch
         float *attn_out = falloc(dim);
-        int ratio = c->compress_ratios ? c->compress_ratios[l_id] : 0;
         // All ratio types (SWA/CSA/HCA) are dispatched inside attention_decode
         attention_decode(m, l, l_id, x_single, pos, attn_out);
         
@@ -795,12 +793,11 @@ static void forward_dsv4(Model *m, int token_id, int pos, float *logits, float *
         
         float *ffn_out = falloc(dim);
         memset(ffn_out, 0, dim * sizeof(float));
-        int inter = c->moe_inter;  // 2048
         
         // Shared Expert FFN
         if (l->shared_w1.fmt != 0 || l->shared_w1.qf) {
             float *sh_out = falloc(dim);
-            ffn_silu(sh_out, x_single, &l->shared_w1, &l->shared_w3, &l->shared_w2, dim, inter);
+            ffn_silu(sh_out, x_single, &l->shared_w1, &l->shared_w3, &l->shared_w2);
             for (int d = 0; d < dim; d++) ffn_out[d] += sh_out[d];
 
         }
@@ -818,7 +815,7 @@ static void forward_dsv4(Model *m, int token_id, int pos, float *logits, float *
             if (l->ex_w1[e].fmt == 0 && !l->ex_w1[e].qf) continue;
             
             float *ex_out = falloc(dim);
-            ffn_silu(ex_out, x_single, &l->ex_w1[e], &l->ex_w3[e], &l->ex_w2[e], dim, inter);
+            ffn_silu(ex_out, x_single, &l->ex_w1[e], &l->ex_w3[e], &l->ex_w2[e]);
             for (int d = 0; d < dim; d++) ffn_out[d] += w * ex_out[d];
 
         }
@@ -922,7 +919,7 @@ static void mtp_draft(Model *m, int draft_token, float *main_hidden, int pos, fl
     memset(ffn_out, 0, dim * sizeof(float));
     if (l->shared_w1.fmt != 0 || l->shared_w1.qf) {
         float *sh_out = falloc(dim);
-        ffn_silu(sh_out, x_single, &l->shared_w1, &l->shared_w3, &l->shared_w2, dim, c->moe_inter);
+        ffn_silu(sh_out, x_single, &l->shared_w1, &l->shared_w3, &l->shared_w2);
         for (int d = 0; d < dim; d++) ffn_out[d] += sh_out[d];
     }
     hc_post(x_multi, ffn_out, residual, post_buf, comb_buf, hc, dim);
@@ -939,7 +936,7 @@ static void load_cfg(Cfg *c, const char *snap) {
     char path[2048]; snprintf(path, sizeof(path), "%s/config.json", snap);
     FILE *f = fopen(path, "rb"); if(!f){perror(path);exit(1);}
     fseek(f,0,SEEK_END); long n=ftell(f); fseek(f,0,SEEK_SET);
-    char *buf = malloc(n+1); if(fread(buf,1,n,f)!=(size_t)n){} buf[n]=0; fclose(f);
+    char *buf = malloc(n+1); if(fread(buf,1,n,f)!=(size_t)n){ perror("fread config.json"); exit(1); } buf[n]=0; fclose(f);
     char *arena=NULL; jval *r = json_parse(buf, &arena);
     
     c->hidden       = (int)json_get(r,"hidden_size")->num;
@@ -1065,7 +1062,8 @@ static int sample_topp(float *logits, int vocab_size, float temperature, float t
     return selected;
 }
 
-int dsv4_main(int argc, char **argv) {
+#ifndef DSV4_SERVER
+int main(int argc, char **argv) {
     setvbuf(stdout, NULL, _IONBF, 0);
     
     if (argc < 2) {
@@ -1162,7 +1160,6 @@ int dsv4_main(int argc, char **argv) {
                 current_token = true_next;
                 draft_token = -1; 
                 accepted_drafts++;
-                total_tokens++;
             } else {
                 printf("%s", buf);
                 current_token = true_next;
@@ -1181,3 +1178,4 @@ int dsv4_main(int argc, char **argv) {
     
     return 0;
 }
+#endif // DSV4_SERVER

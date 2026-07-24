@@ -394,7 +394,7 @@ def main():
         import urllib.request
         idx = json.loads(urllib.request.urlopen(
             f"https://huggingface.co/{a.repo}/resolve/main/model.safetensors.index.json", timeout=30).read())["weight_map"]
-        pref = f"model.layers.{a.n_layers}."
+        pref = "mtp."
         mtp_shards = sorted(set(v for k, v in idx.items() if k.startswith(pref)))
         print(f"[MTP] head at layer {a.n_layers}: {len(mtp_shards)} shards to process: {mtp_shards}")
         for i, sh in enumerate(mtp_shards):

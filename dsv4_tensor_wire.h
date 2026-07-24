@@ -53,7 +53,7 @@ static void *get_mmap_base(int fd) {
 static void qt_load(shards *S, QT *t, const char *name, int O_hint, int I_hint) {
     if (!st_has(S, name)) { memset(t, 0, sizeof(QT)); return; }
     
-    char buf[256]; snprintf(buf, sizeof(buf), "%s.qs", name);
+    char buf[512]; snprintf(buf, sizeof(buf), "%s.qs", name);
     if (st_has(S, buf)) { // It's a quantized tensor
         int64_t O = O_hint > 0 ? O_hint : st_numel(S, buf);
         int64_t numel = st_numel(S, name);
@@ -122,7 +122,7 @@ static void wire_tensors(Model *m) {
         l->ffn_norm = fp32_load(S, snprintf(buf, sizeof(buf), "layers.%d.ffn_norm.weight", i) ? buf : buf);
         
         // Experts
-        int ex_inter = 2048; // DeepSeek-V4 routed expert intermediate size is 2048
+        int ex_inter = c->moe_inter; // DeepSeek-V4 routed expert intermediate size
         for (int e = 0; e < m->c.n_experts; e++) {
             qt_load(S, &l->ex_w1[e], snprintf(buf, sizeof(buf), "layers.%d.ffn.experts.%d.w1.weight", i, e) ? buf : buf, ex_inter, dim);
             qt_load(S, &l->ex_w2[e], snprintf(buf, sizeof(buf), "layers.%d.ffn.experts.%d.w2.weight", i, e) ? buf : buf, dim, ex_inter);
